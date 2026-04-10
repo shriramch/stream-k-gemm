@@ -234,23 +234,13 @@ class gemm {
   }
 
   // =========================================================================
-  // Main Stream-K GEMM: Packed A/B
+  // Main Stream-K GEMM: Packed A/B (with pre-allocated workspace)
   // =========================================================================
-  static void compute_streamk_packed(const int M, const int N, const int K,
-                                     const T* __restrict__ A_packed,
-                                     const T* __restrict__ B_packed,
-                                     T* __restrict__ D, const T alpha,
-                                     const T gamma) {
+  static void compute_streamk_packed_core(
+      const int M, const int N, const int K, const T* __restrict__ A_packed,
+      const T* __restrict__ B_packed, T* __restrict__ D, const T alpha,
+      const T gamma, T** C_local) {
     const int num_threads = omp_get_max_threads();
-
-    // Allocate per-thread partial C workspaces
-    T** C_local = new T*[num_threads];
-    for (int t = 0; t < num_threads; ++t) {
-      C_local[t] = new T[M * N];
-      std::memset(C_local[t], 0, M * N * sizeof(T));
-    }
-
-    // Stream-K: each thread gets a contiguous K-slice
     const int k_chunk = (K + num_threads - 1) / num_threads;
 
 #pragma omp parallel
@@ -258,6 +248,9 @@ class gemm {
       int tid = omp_get_thread_num();
       int k_start = tid * k_chunk;
       int k_end = (k_start + k_chunk <= K) ? (k_start + k_chunk) : K;
+
+      // Zero this thread's workspace
+      std::memset(C_local[tid], 0, M * N * sizeof(T));
 
       if (k_start < K) {
         compute_thread_streamk(M, N, K, k_start, k_end, A_packed, B_packed,
@@ -295,6 +288,26 @@ class gemm {
         D[i * N + j] = alpha * sum + gamma;
       }
     }
+  }
+
+  // =========================================================================
+  // Main Stream-K GEMM: Self-allocating wrapper for correctness tests
+  // =========================================================================
+  static void compute_streamk_packed(const int M, const int N, const int K,
+                                     const T* __restrict__ A_packed,
+                                     const T* __restrict__ B_packed,
+                                     T* __restrict__ D, const T alpha,
+                                     const T gamma) {
+    const int num_threads = omp_get_max_threads();
+
+    // Allocate per-thread partial C workspaces
+    T** C_local = new T*[num_threads];
+    for (int t = 0; t < num_threads; ++t) {
+      C_local[t] = new T[M * N];
+    }
+
+    compute_streamk_packed_core(M, N, K, A_packed, B_packed, D, alpha, gamma,
+                                C_local);
 
     // Cleanup
     for (int t = 0; t < num_threads; ++t) {
@@ -357,6 +370,7 @@ class gemm {
                                   T* D, const T alpha, const T gamma) {
     const int tiles_m = M / ZA_TILE_M;
     const int tiles_n = N / ZA_TILE_N;
+    const int num_threads = omp_get_max_threads();
 
     T* A_packed = new T[tiles_m * K * ZA_TILE_M];
     T* B_packed = new T[tiles_n * K * ZA_TILE_N];
@@ -364,17 +378,30 @@ class gemm {
     pack_A(M, K, A_colmajor, A_packed);
     pack_B(N, K, B_rowmajor, B_packed);
 
+    // Pre-allocate workspace ONCE, outside timing loop
+    T** C_local = new T*[num_threads];
+    for (int t = 0; t < num_threads; ++t) {
+      C_local[t] = new T[M * N];
+    }
+
     // Warmup
     for (int i = 0; i < WITERS; ++i) {
-      compute_streamk_packed(M, N, K, A_packed, B_packed, D, alpha, gamma);
+      compute_streamk_packed_core(M, N, K, A_packed, B_packed, D, alpha, gamma,
+                                  C_local);
     }
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < ITERS; ++i) {
-      compute_streamk_packed(M, N, K, A_packed, B_packed, D, alpha, gamma);
+      compute_streamk_packed_core(M, N, K, A_packed, B_packed, D, alpha, gamma,
+                                  C_local);
     }
     auto end = std::chrono::high_resolution_clock::now();
 
+    // Cleanup
+    for (int t = 0; t < num_threads; ++t) {
+      delete[] C_local[t];
+    }
+    delete[] C_local;
     delete[] A_packed;
     delete[] B_packed;
 

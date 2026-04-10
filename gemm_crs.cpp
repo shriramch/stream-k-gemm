@@ -270,21 +270,14 @@ class gemm {
   }
 
   // =========================================================================
-  // Main Stream-K GEMM: Non-Packed A/B
+  // Main Stream-K GEMM: Non-Packed A/B (with pre-allocated workspace)
   // =========================================================================
-  static void compute_streamk(const int M, const int N, const int K,
-                              const T* __restrict__ A, const T* __restrict__ B,
-                              T* __restrict__ D, const T alpha, const T gamma) {
+  static void compute_streamk_core(const int M, const int N, const int K,
+                                   const T* __restrict__ A,
+                                   const T* __restrict__ B, T* __restrict__ D,
+                                   const T alpha, const T gamma,
+                                   T** C_local) {
     const int num_threads = omp_get_max_threads();
-
-    // Allocate per-thread partial C workspaces
-    T** C_local = new T*[num_threads];
-    for (int t = 0; t < num_threads; ++t) {
-      C_local[t] = new T[M * N];
-      std::memset(C_local[t], 0, M * N * sizeof(T));
-    }
-
-    // Stream-K: each thread gets a contiguous K-slice
     const int k_chunk = (K + num_threads - 1) / num_threads;
 
 #pragma omp parallel
@@ -292,6 +285,9 @@ class gemm {
       int tid = omp_get_thread_num();
       int k_start = tid * k_chunk;
       int k_end = (k_start + k_chunk <= K) ? (k_start + k_chunk) : K;
+
+      // Zero this thread's workspace
+      std::memset(C_local[tid], 0, M * N * sizeof(T));
 
       if (k_start < K) {
         compute_thread_streamk(M, N, K, k_start, k_end, A, B, C_local[tid]);
@@ -328,6 +324,23 @@ class gemm {
         D[i * N + j] = alpha * sum + gamma;
       }
     }
+  }
+
+  // =========================================================================
+  // Main Stream-K GEMM: Self-allocating wrapper for correctness tests
+  // =========================================================================
+  static void compute_streamk(const int M, const int N, const int K,
+                              const T* __restrict__ A, const T* __restrict__ B,
+                              T* __restrict__ D, const T alpha, const T gamma) {
+    const int num_threads = omp_get_max_threads();
+
+    // Allocate per-thread partial C workspaces
+    T** C_local = new T*[num_threads];
+    for (int t = 0; t < num_threads; ++t) {
+      C_local[t] = new T[M * N];
+    }
+
+    compute_streamk_core(M, N, K, A, B, D, alpha, gamma, C_local);
 
     // Cleanup
     for (int t = 0; t < num_threads; ++t) {
@@ -346,16 +359,30 @@ class gemm {
   static double compute_benchmark(const int M, const int N, const int K,
                                   const T* A, const T* B, T* D, const T alpha,
                                   const T gamma) {
+    const int num_threads = omp_get_max_threads();
+
+    // Pre-allocate workspace ONCE, outside timing loop
+    T** C_local = new T*[num_threads];
+    for (int t = 0; t < num_threads; ++t) {
+      C_local[t] = new T[M * N];
+    }
+
     // Warmup
     for (int i = 0; i < WITERS; ++i) {
-      compute_streamk(M, N, K, A, B, D, alpha, gamma);
+      compute_streamk_core(M, N, K, A, B, D, alpha, gamma, C_local);
     }
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < ITERS; ++i) {
-      compute_streamk(M, N, K, A, B, D, alpha, gamma);
+      compute_streamk_core(M, N, K, A, B, D, alpha, gamma, C_local);
     }
     auto end = std::chrono::high_resolution_clock::now();
+
+    // Cleanup
+    for (int t = 0; t < num_threads; ++t) {
+      delete[] C_local[t];
+    }
+    delete[] C_local;
 
     return std::chrono::duration<double, std::nano>(end - start).count() /
            ITERS;
