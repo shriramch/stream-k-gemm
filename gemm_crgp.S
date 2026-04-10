@@ -213,7 +213,7 @@ Disassembly of section .text:
      b60: 97ffffa4     	bl	0x9f0 <printf@plt>
      b64: d0000000     	adrp	x0, 0x2000 <_ZN4gemmIdE14compute_packedEiiiPKdS2_Pddd.omp_outlined+0x718>
      b68: 91290c00     	add	x0, x0, #0xa43
-     b6c: 52800041     	mov	w1, #0x2                // =2
+     b6c: 528004c1     	mov	w1, #0x26               // =38
      b70: 97ffffa0     	bl	0x9f0 <printf@plt>
      b74: d0000000     	adrp	x0, 0x2000 <_ZN4gemmIdE14compute_packedEiiiPKdS2_Pddd.omp_outlined+0x718>
      b78: 912ed400     	add	x0, x0, #0xbb5
@@ -297,7 +297,7 @@ Disassembly of section .text:
      cb0: 52820003     	mov	w3, #0x1000             // =4096
      cb4: 52800044     	mov	w4, #0x2                // =2
      cb8: 97ffff4e     	bl	0x9f0 <printf@plt>
-     cbc: 52800040     	mov	w0, #0x2                // =2
+     cbc: 528004c0     	mov	w0, #0x26               // =38
      cc0: 97ffff38     	bl	0x9a0 <omp_set_num_threads@plt>
      cc4: aa1403e0     	mov	x0, x20
      cc8: aa1503e1     	mov	x1, x21
@@ -350,7 +350,7 @@ Disassembly of section .text:
      d7c: 1e604028     	fmov	d8, d1
      d80: 1e604009     	fmov	d9, d0
      d84: 97ffff1b     	bl	0x9f0 <printf@plt>
-     d88: 52800040     	mov	w0, #0x2                // =2
+     d88: 528004c0     	mov	w0, #0x26               // =38
      d8c: 97ffff05     	bl	0x9a0 <omp_set_num_threads@plt>
      d90: 1b197e68     	mul	w8, w19, w25
      d94: d37d7d00     	ubfiz	x0, x8, #3, #32

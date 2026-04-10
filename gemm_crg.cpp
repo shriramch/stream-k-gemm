@@ -23,7 +23,7 @@
 #endif
 
 #ifndef NUM_THREADS
-#define NUM_THREADS 2
+#define NUM_THREADS 38
 #endif
 
 // =============================================================================
