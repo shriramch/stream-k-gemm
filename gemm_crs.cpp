@@ -36,6 +36,7 @@
 // Stream-K parameters
 // =============================================================================
 constexpr int KC = 2048;     // K block size for cache blocking
+constexpr int NC = 64;       // N block size (2 micro-tiles)
 constexpr int K_UNROLL = 8;  // Unroll factor
 constexpr int PF_DIST = 16;  // Prefetch distance
 
@@ -200,6 +201,7 @@ class gemm {
   // =========================================================================
   // Stream-K: Each thread processes its K-slice for ALL M,N tiles
   // Non-packed: A is column-major, B is row-major
+  // L2-blocked: kc/nc on OUTSIDE to keep A/B panels hot in cache
   // =========================================================================
   static __forceinline void compute_tile_streamk(
       const int M, const int N, const int K, const int k_start, const int k_end,
@@ -211,41 +213,44 @@ class gemm {
   {
     const int tiles_m = M / ZA_TILE_M;
     const int tiles_n = N / ZA_TILE_N;
+    constexpr int nc_tiles = NC / ZA_TILE_N;
     const int k_len = k_end - k_start;
 
     pred_t ptrue = svptrue_b64();
 
-    // Process all M,N tiles for this thread's K-slice
-    for (int tm = 0; tm < tiles_m; ++tm) {
-      for (int tn = 0; tn < tiles_n; ++tn) {
-        // Non-packed pointers for this thread's K-slice
-        // A: column-major [M][K], access A[tm*ZA_TILE_M, k_start]
-        // B: row-major [K][N], access B[k_start, tn*ZA_TILE_N]
-        const T* a_ptr = A + tm * ZA_TILE_M + k_start * M;
-        const T* b_ptr = B + k_start * N + tn * ZA_TILE_N;
-        T* c_ptr = C_local + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
+    // 1. K-Blocking on the OUTSIDE (keeps A panel hot in L2)
+    for (int kc = 0; kc < k_len; kc += KC) {
+      const int kb_len = (kc + KC <= k_len) ? KC : (k_len - kc);
+      const bool is_first = (kc == 0);
 
-        // For K-blocked processing within the K-slice
-        bool first_block = true;
-        int k_processed = 0;
-        while (k_processed < k_len) {
-          const int kb_len =
-              (k_processed + KC <= k_len) ? KC : (k_len - k_processed);
+      // 2. N-Blocking to keep B panel in L2 cache
+      for (int nc = 0; nc < tiles_n; nc += nc_tiles) {
+        const int tn_end =
+            (nc + nc_tiles <= tiles_n) ? nc_tiles : (tiles_n - nc);
 
-          if (first_block) {
-            svzero_za();
-            first_block = false;
-          } else {
-            load_partial_c(N, c_ptr, ptrue);
+        // 3. Process the M/N tiles that fit within this L2 block
+        for (int tm = 0; tm < tiles_m; ++tm) {
+          for (int tn_local = 0; tn_local < tn_end; ++tn_local) {
+            const int tn = nc + tn_local;
+
+            // Pointers offset by k_start AND the current kc block
+            // A: column-major [M][K], B: row-major [K][N]
+            const T* a_ptr = A + tm * ZA_TILE_M + (k_start + kc) * M;
+            const T* b_ptr = B + (k_start + kc) * N + tn * ZA_TILE_N;
+            T* c_ptr = C_local + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
+
+            if (is_first) {
+              svzero_za();
+            } else {
+              load_partial_c(N, c_ptr, ptrue);
+            }
+
+            microkernel_gather(M, N, kb_len, a_ptr, b_ptr, ptrue);
+
+            // Always store partials to workspace
+            // alpha/gamma scaling happens in the OpenMP reduction later
+            store_partial_c(N, c_ptr, ptrue);
           }
-
-          microkernel_gather(M, N, kb_len, a_ptr, b_ptr, ptrue);
-
-          store_partial_c(N, c_ptr, ptrue);
-
-          a_ptr += kb_len * M;
-          b_ptr += kb_len * N;
-          k_processed += kb_len;
         }
       }
     }
