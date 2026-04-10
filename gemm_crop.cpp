@@ -1,7 +1,17 @@
-// SME GEMM with Cache Blocking and Linear Prefetch
+// SME GEMM with Ping-Pong Software Pipelining (Packed)
+// Uses double-buffering to hide memory latency behind compute
 // PACKED input: A_packed[tiles_m][K][ZA_TILE_M],
-// B_packed[tiles_n][K][ZA_TILE_N] Uses simple linear prefetch (data is
-// contiguous in K dimension)
+// B_packed[tiles_n][K][ZA_TILE_N]
+//
+// Ping-pong technique:
+// - While executing math for iteration K, load data for K+1
+// - Uses separate register sets to break RAW dependency chains
+// - Allows OOE engine to dual-issue loads and mopa instructions
+//
+// Combined with packing:
+// - Packed data is contiguous in K dimension (stride = ZA_TILE_M/N)
+// - Eliminates strided access patterns entirely
+// - Perfect for L1/L2 cache line utilization
 //
 // D = alpha * A * B + gamma
 
@@ -27,12 +37,6 @@
 #define NUM_THREADS 38
 #endif
 
-// Define SKIP_VERIFY to disable naive kernel and verification
-// #define SKIP_VERIFY
-
-// =============================================================================
-// Cache blocking and prefetch parameters
-// =============================================================================
 #ifndef KC
 #define KC 2048
 #endif
@@ -41,11 +45,11 @@
 #define NC 64
 #endif
 
-constexpr int K_UNROLL = 8;  // Unroll factor
-constexpr int PF_DIST = 16;  // Prefetch distance in K iterations
+// Define SKIP_VERIFY to disable naive kernel and verification
+// #define SKIP_VERIFY
 
 // =============================================================================
-// GEMM class with linear prefetch for packed input
+// GEMM class with ping-pong software pipelining and packing
 // =============================================================================
 
 template <typename T>
@@ -59,48 +63,87 @@ class gemm {
   using pred_t = svbool_t;
 
   // =========================================================================
-  // Micro-kernel with linear prefetch for contiguous packed A/B
-  // A_packed: contiguous [K][ZA_TILE_M], stride = ZA_TILE_M = 128 bytes
-  // B_packed: contiguous [K][ZA_TILE_N], stride = ZA_TILE_N = 256 bytes
+  // Ping-pong microkernel for packed input
+  //
+  // Data layout (packed):
+  //   A_packed: [tiles_m][K][ZA_TILE_M] - contiguous, stride=ZA_TILE_M=16
+  //   B_packed: [tiles_n][K][ZA_TILE_N] - contiguous, stride=ZA_TILE_N=32
+  //
+  // Ping-pong:
+  //   - curr_* holds data for iteration K (being executed)
+  //   - next_* holds data for iteration K+1 (being loaded)
+  //   - OOE dual-issues the loads and mopa instructions
   // =========================================================================
-  static __forceinline void microkernel_prefetch(
-      const int k_len, const T* __restrict__ a_ptr, const T* __restrict__ b_ptr,
+  static __forceinline void microkernel_pingpong(
+      const int k_len, const T* __restrict__ a_in, const T* __restrict__ b_in,
       const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
       __arm_inout("za")
 #endif
   {
-    for (int k = 0; k < k_len; ++k) {
-      // Linear prefetch PF_DIST iterations ahead
-      if (k + PF_DIST < k_len) {
-        __builtin_prefetch(a_ptr + PF_DIST * ZA_TILE_M, 0, 3);
-        __builtin_prefetch(b_ptr + PF_DIST * ZA_TILE_N, 0, 3);
-      }
+    const T* a_ptr = a_in;
+    const T* b_ptr = b_in;
 
-      vec_t a0 = svld1_vnum(ptrue, a_ptr, 0);
-      vec_t a1 = svld1_vnum(ptrue, a_ptr, 1);
+    // Handle empty case
+    if (k_len <= 0) return;
 
-      vec_t b0 = svld1_vnum(ptrue, b_ptr, 0);
-      vec_t b1 = svld1_vnum(ptrue, b_ptr, 1);
-      vec_t b2 = svld1_vnum(ptrue, b_ptr, 2);
-      vec_t b3 = svld1_vnum(ptrue, b_ptr, 3);
+    // === Pre-load first iteration (K=0) into "current" registers ===
+    vec_t curr_a0 = svld1_vnum(ptrue, a_ptr, 0);
+    vec_t curr_a1 = svld1_vnum(ptrue, a_ptr, 1);
+    vec_t curr_b0 = svld1_vnum(ptrue, b_ptr, 0);
+    vec_t curr_b1 = svld1_vnum(ptrue, b_ptr, 1);
+    vec_t curr_b2 = svld1_vnum(ptrue, b_ptr, 2);
+    vec_t curr_b3 = svld1_vnum(ptrue, b_ptr, 3);
 
-      svmopa_za64_f64_m(0, ptrue, ptrue, a0, b0);
-      svmopa_za64_f64_m(1, ptrue, ptrue, a0, b1);
-      svmopa_za64_f64_m(2, ptrue, ptrue, a0, b2);
-      svmopa_za64_f64_m(3, ptrue, ptrue, a0, b3);
-      svmopa_za64_f64_m(4, ptrue, ptrue, a1, b0);
-      svmopa_za64_f64_m(5, ptrue, ptrue, a1, b1);
-      svmopa_za64_f64_m(6, ptrue, ptrue, a1, b2);
-      svmopa_za64_f64_m(7, ptrue, ptrue, a1, b3);
+    a_ptr += ZA_TILE_M;  // Stride=16 for packed A
+    b_ptr += ZA_TILE_N;  // Stride=32 for packed B
+
+    // === Main loop: ping-pong between register sets ===
+    for (int k = 0; k < k_len - 1; ++k) {
+      // Load NEXT iteration into separate registers
+      // OOE can dual-issue these with the mopa instructions below
+      vec_t next_a0 = svld1_vnum(ptrue, a_ptr, 0);
+      vec_t next_a1 = svld1_vnum(ptrue, a_ptr, 1);
+      vec_t next_b0 = svld1_vnum(ptrue, b_ptr, 0);
+      vec_t next_b1 = svld1_vnum(ptrue, b_ptr, 1);
+      vec_t next_b2 = svld1_vnum(ptrue, b_ptr, 2);
+      vec_t next_b3 = svld1_vnum(ptrue, b_ptr, 3);
+
+      // Execute math on CURRENT (no RAW hazard - data already loaded)
+      svmopa_za64_f64_m(0, ptrue, ptrue, curr_a0, curr_b0);
+      svmopa_za64_f64_m(1, ptrue, ptrue, curr_a0, curr_b1);
+      svmopa_za64_f64_m(2, ptrue, ptrue, curr_a0, curr_b2);
+      svmopa_za64_f64_m(3, ptrue, ptrue, curr_a0, curr_b3);
+      svmopa_za64_f64_m(4, ptrue, ptrue, curr_a1, curr_b0);
+      svmopa_za64_f64_m(5, ptrue, ptrue, curr_a1, curr_b1);
+      svmopa_za64_f64_m(6, ptrue, ptrue, curr_a1, curr_b2);
+      svmopa_za64_f64_m(7, ptrue, ptrue, curr_a1, curr_b3);
+
+      // Swap: current becomes next for the next iteration
+      curr_a0 = next_a0;
+      curr_a1 = next_a1;
+      curr_b0 = next_b0;
+      curr_b1 = next_b1;
+      curr_b2 = next_b2;
+      curr_b3 = next_b3;
 
       a_ptr += ZA_TILE_M;
       b_ptr += ZA_TILE_N;
     }
+
+    // === Final iteration: just execute math, no next load ===
+    svmopa_za64_f64_m(0, ptrue, ptrue, curr_a0, curr_b0);
+    svmopa_za64_f64_m(1, ptrue, ptrue, curr_a0, curr_b1);
+    svmopa_za64_f64_m(2, ptrue, ptrue, curr_a0, curr_b2);
+    svmopa_za64_f64_m(3, ptrue, ptrue, curr_a0, curr_b3);
+    svmopa_za64_f64_m(4, ptrue, ptrue, curr_a1, curr_b0);
+    svmopa_za64_f64_m(5, ptrue, ptrue, curr_a1, curr_b1);
+    svmopa_za64_f64_m(6, ptrue, ptrue, curr_a1, curr_b2);
+    svmopa_za64_f64_m(7, ptrue, ptrue, curr_a1, curr_b3);
   }
 
   // =========================================================================
-  // Load/Store C from/to row-major (same as non-packed version)
+  // Load partial C from row-major
   // =========================================================================
   static __forceinline void load_partial_c(const int N,
                                            const T* __restrict__ c_ptr,
@@ -134,6 +177,9 @@ class gemm {
     }
   }
 
+  // =========================================================================
+  // Store partial C to row-major
+  // =========================================================================
   static __forceinline void store_partial_c(const int N, T* __restrict__ c_ptr,
                                             const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
@@ -167,6 +213,9 @@ class gemm {
     }
   }
 
+  // =========================================================================
+  // Store final C with scaling
+  // =========================================================================
   static __forceinline void store_final_c(const int N, T* __restrict__ c_ptr,
                                           const T alpha, const T gamma,
                                           const pred_t ptrue) __arm_streaming
@@ -222,13 +271,16 @@ class gemm {
       __arm_inout("za")
 #endif
   {
-    constexpr int nc_tiles = NC / ZA_TILE_N;
+    const int nc_tiles = NC / ZA_TILE_N;
 
+    // Cache blocking: kc OUTSIDE, nc INSIDE
+    // This keeps A panel hot in L2 across all N tiles
     for (int kc = 0; kc < K; kc += KC) {
       const int k_len = (kc + KC <= K) ? KC : (K - kc);
       const bool is_first = (kc == 0);
       const bool is_last = (kc + KC >= K);
 
+      // N blocking for B panel locality
       for (int nc = 0; nc < tiles_n; nc += nc_tiles) {
         const int tn_end =
             (nc + nc_tiles <= tiles_n) ? nc_tiles : (tiles_n - nc);
@@ -236,7 +288,7 @@ class gemm {
         for (int tn_local = 0; tn_local < tn_end; ++tn_local) {
           const int tn = nc + tn_local;
 
-          // Packed pointers
+          // Packed pointers: contiguous K dim
           const T* a_ptr = A_packed + (tm * K + kc) * ZA_TILE_M;
           const T* b_ptr = B_packed + (tn * K + kc) * ZA_TILE_N;
           T* c_ptr = D + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
@@ -247,7 +299,8 @@ class gemm {
             load_partial_c(N, c_ptr, ptrue);
           }
 
-          microkernel_prefetch(k_len, a_ptr, b_ptr, ptrue);
+          // Ping-pong microkernel hides memory latency
+          microkernel_pingpong(k_len, a_ptr, b_ptr, ptrue);
 
           if (is_last) {
             store_final_c(N, c_ptr, alpha, gamma, ptrue);
@@ -276,7 +329,7 @@ class gemm {
   }
 
   // =========================================================================
-  // Main GEMM: packed A/B with prefetch, row-major C (NO SME attributes)
+  // Main GEMM: packed A/B with ping-pong, row-major C (NO SME attributes)
   // =========================================================================
   static void compute_packed(const int M, const int N, const int K,
                              const T* __restrict__ A_packed,
@@ -380,7 +433,7 @@ template <typename T>
 bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   const char* type_name = std::is_same<T, float>::value ? "float" : "double";
   printf(
-      "Testing GEMM<%s> PACKED+PREFETCH: M=%d N=%d K=%d alpha=%.2f "
+      "Testing GEMM<%s> PING-PONG PACKED: M=%d N=%d K=%d alpha=%.2f "
       "gamma=%.2f\n",
       type_name, M, N, K, alpha, gamma);
 
@@ -454,10 +507,10 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 }
 
 int main(int argc, char** argv) {
-  printf("SME GEMM - Packed + Linear Prefetch\n");
+  printf("SME GEMM - Ping-Pong Software Pipelining (Packed)\n");
   printf("SVL=%d, ZA_TILE_M=%d, ZA_TILE_N=%d\n", SVL, gemm<double>::ZA_TILE_M,
          gemm<double>::ZA_TILE_N);
-  printf("KC=%d, NC=%d, K_UNROLL=%d, PF_DIST=%d\n", KC, NC, K_UNROLL, PF_DIST);
+  printf("KC=%d, NC=%d\n", KC, NC);
   printf("Threads=%d\n\n", NUM_THREADS);
 
   int passed = 0, total = 0;
@@ -482,7 +535,7 @@ int main(int argc, char** argv) {
 
   printf("\n=== Benchmark ===\n");
   {
-    const int M = 64, N = 128, K = 4096;
+    int M = 64, N = 128, K = 4096;
     if (argc == 4) {
       M = std::atoi(argv[1]);
       N = std::atoi(argv[2]);

@@ -19,14 +19,22 @@ CPPFLAGS += -I${HBMROOT}/include -DUSE_HBM
 LDFLAGS = --rtlib=compiler-rt
 LDLIBS = -lm -lmemkind -lhwloc -lnuma -L${HBMROOT}/lib -lunwind -latomic
 
+# =============================================================================
+# Cache blocking parameters (override via: make KC=1024 NC=128 gemm_crop)
+# =============================================================================
+KC ?= 2048
+NC ?= 64
+
+# =============================================================================
 # Targets
-TARGETS = gemm_cr gemm_crb gemm_crbp gemm_crg gemm_crgp gemm_crs gemm_crsp
+# =============================================================================
+TARGETS = gemm_cr gemm_crb gemm_crbp gemm_crg gemm_crgp gemm_crs gemm_crsp gemm_cro gemm_crop
 
 all: $(TARGETS)
 
-# Generic rule: compile each variant directly from its respective .cpp file
+# Generic rule with KC/NC passed as preprocessor defines
 %: %.cpp
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -DKC=$(KC) -DNC=$(NC) $< -o $@ $(LDFLAGS) $(LDLIBS)
 
 .PHONY: clean
 clean:

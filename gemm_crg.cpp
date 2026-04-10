@@ -32,8 +32,14 @@
 // =============================================================================
 // Cache blocking and prefetch parameters
 // =============================================================================
-constexpr int KC = 2048;     // K block size
-constexpr int NC = 64;       // N block size
+#ifndef KC
+#define KC 2048
+#endif
+
+#ifndef NC
+#define NC 64
+#endif
+
 constexpr int K_UNROLL = 8;  // Unroll factor (matches SVE 512-bit = 8 f64)
 constexpr int PF_DIST = 16;  // Prefetch distance in K iterations
 

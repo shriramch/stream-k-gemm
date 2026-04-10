@@ -35,8 +35,14 @@
 // =============================================================================
 // Stream-K parameters
 // =============================================================================
-constexpr int KC = 2048;     // K block size for cache blocking within K-slice
-constexpr int NC = 64;       // N block size (2 micro-tiles)
+#ifndef KC
+#define KC 2048
+#endif
+
+#ifndef NC
+#define NC 64
+#endif
+
 constexpr int PF_DIST = 16;  // Prefetch distance
 
 // =============================================================================

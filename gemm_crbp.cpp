@@ -34,8 +34,13 @@
 // =============================================================================
 // Cache blocking parameters
 // =============================================================================
-constexpr int KC = 2048;  // K block size (L2 level)
-constexpr int NC = 64;    // N block size (2 micro-tiles)
+#ifndef KC
+#define KC 2048
+#endif
+
+#ifndef NC
+#define NC 64
+#endif
 
 // =============================================================================
 // GEMM class with packed A/B, row-major C
