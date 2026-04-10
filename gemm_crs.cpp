@@ -275,8 +275,7 @@ class gemm {
   static void compute_streamk_core(const int M, const int N, const int K,
                                    const T* __restrict__ A,
                                    const T* __restrict__ B, T* __restrict__ D,
-                                   const T alpha, const T gamma,
-                                   T** C_local) {
+                                   const T alpha, const T gamma, T** C_local) {
     const int num_threads = omp_get_max_threads();
     const int k_chunk = (K + num_threads - 1) / num_threads;
 
@@ -285,9 +284,6 @@ class gemm {
       int tid = omp_get_thread_num();
       int k_start = tid * k_chunk;
       int k_end = (k_start + k_chunk <= K) ? (k_start + k_chunk) : K;
-
-      // Zero this thread's workspace
-      std::memset(C_local[tid], 0, M * N * sizeof(T));
 
       if (k_start < K) {
         compute_thread_streamk(M, N, K, k_start, k_end, A, B, C_local[tid]);
@@ -337,7 +333,7 @@ class gemm {
     // Allocate per-thread partial C workspaces
     T** C_local = new T*[num_threads];
     for (int t = 0; t < num_threads; ++t) {
-      C_local[t] = new T[M * N];
+      C_local[t] = new T[M * N]();
     }
 
     compute_streamk_core(M, N, K, A, B, D, alpha, gamma, C_local);
