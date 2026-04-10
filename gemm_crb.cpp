@@ -20,6 +20,7 @@
 #include <type_traits>
 
 #include "utils.hpp"
+#include "hbm_alloc.hpp"
 
 #ifndef WITERS
 #define WITERS 1
@@ -349,9 +350,9 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   omp_set_num_threads(NUM_THREADS);
 
   // Allocate matrices
-  T* A = new T[M * K];  // column-major
-  T* B = new T[K * N];  // row-major
-  T* D = new T[M * N];  // row-major (output)
+  T* A = hbm_alloc<T>(M * K);  // column-major
+  T* B = hbm_alloc<T>(K * N);  // row-major
+  T* D = hbm_alloc<T>(M * N);  // row-major (output)
 
   // Initialize
   for (int j = 0; j < K; ++j) {
@@ -371,13 +372,13 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 
 #ifdef SKIP_VERIFY
   printf("  SKIPPED verification (SKIP_VERIFY defined)\n");
-  delete[] A;
-  delete[] B;
-  delete[] D;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
   return true;
 #else
   // Reference computation
-  T* D_ref = new T[M * N];
+  T* D_ref = hbm_alloc<T>(M * N);
   std::memset(D_ref, 0, M * N * sizeof(T));
   for (int i = 0; i < M; ++i) {
     for (int j = 0; j < N; ++j) {
@@ -411,16 +412,17 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
     printf("  FAILED! (max_rel_err=%.2e)\n", max_err);
   }
 
-  delete[] A;
-  delete[] B;
-  delete[] D;
-  delete[] D_ref;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
+  hbm_free(D_ref);
 
   return pass;
 #endif
 }
 
 int main(int argc, char** argv) {
+  hbm_init();
   printf("SME GEMM with Cache Blocking\n");
   printf("SVL=%d bytes, SVCNT=%d\n", SVL, gemm<double>::SVCNT);
   printf("ZA_TILE_M=%d, ZA_TILE_N=%d\n", gemm<double>::ZA_TILE_M,
@@ -461,9 +463,9 @@ int main(int argc, char** argv) {
       N = std::atoi(argv[2]);
       K = std::atoi(argv[3]);
     }
-    double* A = new double[M * K];
-    double* B = new double[K * N];
-    double* D = new double[M * N];
+    double* A = hbm_alloc<double>(M * K);
+    double* B = hbm_alloc<double>(K * N);
+    double* D = hbm_alloc<double>(M * N);
     std::memset(A, 0, M * K * sizeof(double));
     std::memset(B, 0, K * N * sizeof(double));
     std::memset(D, 0, M * N * sizeof(double));
@@ -476,9 +478,9 @@ int main(int argc, char** argv) {
     double gflops = (2.0 * M * N * K) / ns;
     printf("  Time: %.2f ns, %.2f gflop/s\n", ns, gflops);
 
-    delete[] A;
-    delete[] B;
-    delete[] D;
+    hbm_free(A);
+    hbm_free(B);
+    hbm_free(D);
   }
 
   return (passed == total) ? 0 : 1;

@@ -11,6 +11,7 @@
 #include <type_traits>
 
 #include "utils.hpp"
+#include "hbm_alloc.hpp"
 
 #ifndef WITERS
 #define WITERS 1
@@ -223,9 +224,9 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   omp_set_num_threads(NUM_THREADS);
 
   // Allocate matrices
-  T* A = new T[M * K];
-  T* B = new T[K * N];
-  T* D = new T[M * N];
+  T* A = hbm_alloc<T>(M * K);
+  T* B = hbm_alloc<T>(K * N);
+  T* D = hbm_alloc<T>(M * N);
 
   // Initialize A (column-major), B (row-major), D
   for (int k = 0; k < K; ++k) {
@@ -249,13 +250,13 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 
 #ifdef SKIP_VERIFY
   printf("  SKIPPED verification (SKIP_VERIFY defined)\n");
-  delete[] A;
-  delete[] B;
-  delete[] D;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
   return true;
 #else
   // Reference
-  T* D_ref = new T[M * N];
+  T* D_ref = hbm_alloc<T>(M * N);
   for (int i = 0; i < M * N; ++i) D_ref[i] = static_cast<T>(0.0);
   naive_gemm<T>(M, N, K, A, B, D_ref, alpha, gamma);
 
@@ -284,10 +285,10 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
            (double)D_ref[err_idx]);
   }
 
-  delete[] A;
-  delete[] B;
-  delete[] D;
-  delete[] D_ref;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
+  hbm_free(D_ref);
 
   return passed;
 #endif
@@ -301,9 +302,9 @@ void benchmark_gemm(int M, int N, int K, T alpha, T gamma) {
   omp_set_num_threads(NUM_THREADS);
 
   // Each thread gets its own A, B, D (for now, simple parallel over outputs)
-  T* A = new T[M * K];
-  T* B = new T[K * N];
-  T* D = new T[M * N];
+  T* A = hbm_alloc<T>(M * K);
+  T* B = hbm_alloc<T>(K * N);
+  T* D = hbm_alloc<T>(M * N);
 
   for (int i = 0; i < M * K; ++i) A[i] = static_cast<T>(i * 0.0001);
   for (int i = 0; i < K * N; ++i) B[i] = static_cast<T>(i * 0.0001);
@@ -320,12 +321,13 @@ void benchmark_gemm(int M, int N, int K, T alpha, T gamma) {
   printf("  avg=%.3f ns, %.2f gflop/s\n", avg_ns, gflops);
   printf("  throughput per thread: %.2f gflop/s\n", gflops / NUM_THREADS);
 
-  delete[] A;
-  delete[] B;
-  delete[] D;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
 }
 
 int main(int argc, char** argv) {
+  hbm_init();
   printf("SME GEMM Test - SVL=%d bytes, SVCNT=%d, ZA_TILE_M=%d, ZA_TILE_N=%d\n",
          SVL, gemm<TYPE>::SVCNT, gemm<TYPE>::ZA_TILE_M, gemm<TYPE>::ZA_TILE_N);
 

@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include "utils.hpp"
+#include "hbm_alloc.hpp"
 
 #ifndef WITERS
 #define WITERS 1
@@ -373,9 +374,9 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 
   omp_set_num_threads(NUM_THREADS);
 
-  T* A = new T[M * K];
-  T* B = new T[K * N];
-  T* D = new T[M * N];
+  T* A = hbm_alloc<T>(M * K);
+  T* B = hbm_alloc<T>(K * N);
+  T* D = hbm_alloc<T>(M * N);
 
   for (int j = 0; j < K; ++j) {
     for (int i = 0; i < M; ++i) {
@@ -393,12 +394,12 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 
 #ifdef SKIP_VERIFY
   printf("  SKIPPED verification (SKIP_VERIFY defined)\n");
-  delete[] A;
-  delete[] B;
-  delete[] D;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
   return true;
 #else
-  T* D_ref = new T[M * N];
+  T* D_ref = hbm_alloc<T>(M * N);
   std::memset(D_ref, 0, M * N * sizeof(T));
   for (int i = 0; i < M; ++i) {
     for (int j = 0; j < N; ++j) {
@@ -431,16 +432,17 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
     printf("  FAILED! (max_rel_err=%.2e)\n", max_err);
   }
 
-  delete[] A;
-  delete[] B;
-  delete[] D;
-  delete[] D_ref;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
+  hbm_free(D_ref);
 
   return pass;
 #endif
 }
 
 int main(int argc, char** argv) {
+  hbm_init();
   printf("SME GEMM - Gather Prefetch (Non-Packed)\n");
   printf("SVL=%d, ZA_TILE_M=%d, ZA_TILE_N=%d\n", SVL, gemm<double>::ZA_TILE_M,
          gemm<double>::ZA_TILE_N);
@@ -475,9 +477,9 @@ int main(int argc, char** argv) {
       N = std::atoi(argv[2]);
       K = std::atoi(argv[3]);
     }
-    double* A = new double[M * K];
-    double* B = new double[K * N];
-    double* D = new double[M * N];
+    double* A = hbm_alloc<double>(M * K);
+    double* B = hbm_alloc<double>(K * N);
+    double* D = hbm_alloc<double>(M * N);
     std::memset(A, 0, M * K * sizeof(double));
     std::memset(B, 0, K * N * sizeof(double));
     std::memset(D, 0, M * N * sizeof(double));
@@ -489,9 +491,9 @@ int main(int argc, char** argv) {
     double gflops = (2.0 * M * N * K) / ns;
     printf("  Time: %.2f us, %.2f GFLOP/s\n", ns / 1000.0, gflops);
 
-    delete[] A;
-    delete[] B;
-    delete[] D;
+    hbm_free(A);
+    hbm_free(B);
+    hbm_free(D);
   }
 
   return (passed == total) ? 0 : 1;

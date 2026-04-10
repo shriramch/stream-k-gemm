@@ -16,6 +16,7 @@
 #include <type_traits>
 
 #include "utils.hpp"
+#include "hbm_alloc.hpp"
 
 #ifndef WITERS
 #define WITERS 1
@@ -337,18 +338,18 @@ class gemm {
     const int num_threads = omp_get_max_threads();
 
     // Allocate per-thread partial C workspaces
-    T** C_local = new T*[num_threads];
+    T** C_local = hbm_alloc<T*>(num_threads);
     for (int t = 0; t < num_threads; ++t) {
-      C_local[t] = new T[M * N]();
+      C_local[t] = hbm_calloc<T>(M * N);
     }
 
     compute_streamk_core(M, N, K, A, B, D, alpha, gamma, C_local);
 
     // Cleanup
     for (int t = 0; t < num_threads; ++t) {
-      delete[] C_local[t];
+      hbm_free(C_local[t]);
     }
-    delete[] C_local;
+    hbm_free(C_local);
   }
 
   // Test wrapper (NO SME attributes)
@@ -364,9 +365,9 @@ class gemm {
     const int num_threads = omp_get_max_threads();
 
     // Pre-allocate workspace ONCE, outside timing loop
-    T** C_local = new T*[num_threads];
+    T** C_local = hbm_alloc<T*>(num_threads);
     for (int t = 0; t < num_threads; ++t) {
-      C_local[t] = new T[M * N];
+      C_local[t] = hbm_alloc<T>(M * N);
     }
 
     // Warmup
@@ -382,9 +383,9 @@ class gemm {
 
     // Cleanup
     for (int t = 0; t < num_threads; ++t) {
-      delete[] C_local[t];
+      hbm_free(C_local[t]);
     }
-    delete[] C_local;
+    hbm_free(C_local);
 
     return std::chrono::duration<double, std::nano>(end - start).count() /
            ITERS;
@@ -403,9 +404,9 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 
   omp_set_num_threads(NUM_THREADS);
 
-  T* A = new T[M * K];
-  T* B = new T[K * N];
-  T* D = new T[M * N];
+  T* A = hbm_alloc<T>(M * K);
+  T* B = hbm_alloc<T>(K * N);
+  T* D = hbm_alloc<T>(M * N);
 
   // A: column-major [M][K]
   for (int j = 0; j < K; ++j) {
@@ -425,13 +426,13 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 
 #ifdef SKIP_VERIFY
   printf("  SKIPPED verification (SKIP_VERIFY defined)\n");
-  delete[] A;
-  delete[] B;
-  delete[] D;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
   return true;
 #else
   // Reference: A column-major, B row-major
-  T* D_ref = new T[M * N];
+  T* D_ref = hbm_alloc<T>(M * N);
   std::memset(D_ref, 0, M * N * sizeof(T));
   for (int i = 0; i < M; ++i) {
     for (int j = 0; j < N; ++j) {
@@ -464,16 +465,17 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
     printf("  FAILED! (max_rel_err=%.2e)\n", max_err);
   }
 
-  delete[] A;
-  delete[] B;
-  delete[] D;
-  delete[] D_ref;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
+  hbm_free(D_ref);
 
   return pass;
 #endif
 }
 
 int main(int argc, char* argv[]) {
+  hbm_init();
   printf("SME GEMM - Stream-K (Non-Packed, Gather Prefetch)\n");
   printf("SVL=%d, ZA_TILE_M=%d, ZA_TILE_N=%d\n", SVL, gemm<double>::ZA_TILE_M,
          gemm<double>::ZA_TILE_N);
@@ -508,9 +510,9 @@ int main(int argc, char* argv[]) {
   printf("M=%d N=%d K=%d (K blocks=%d)\n", M, N, K, k_blocks);
 
   omp_set_num_threads(NUM_THREADS);
-  double* A = new double[M * K];
-  double* B = new double[K * N];
-  double* D = new double[M * N];
+  double* A = hbm_alloc<double>(M * K);
+  double* B = hbm_alloc<double>(K * N);
+  double* D = hbm_alloc<double>(M * N);
 
   for (int i = 0; i < M * K; ++i) A[i] = 0.001 * i;
   for (int i = 0; i < K * N; ++i) B[i] = 0.001 * i;
@@ -523,9 +525,9 @@ int main(int argc, char* argv[]) {
 
   printf("  Time: %.2f us, %.2f GFLOP/s\n", time_us, gflops);
 
-  delete[] A;
-  delete[] B;
-  delete[] D;
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
 
   return 0;
 }
