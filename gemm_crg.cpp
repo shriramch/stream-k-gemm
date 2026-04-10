@@ -26,6 +26,9 @@
 #define NUM_THREADS 38
 #endif
 
+// Define SKIP_VERIFY to disable naive kernel and verification
+// #define SKIP_VERIFY
+
 // =============================================================================
 // Cache blocking and prefetch parameters
 // =============================================================================
@@ -244,22 +247,19 @@ class gemm {
   }
 
   // =========================================================================
-  // Main GEMM with cache blocking and gather prefetch
+  // Thread-local execution: processes ALL kc/nc for this thread's M tile
+  // Only ONE smstart/smstop per thread per GEMM call
   // =========================================================================
-  static __forceinline void compute(const int M, const int N, const int K,
-                                    const T* __restrict__ ptr_a,
-                                    const T* __restrict__ ptr_b,
-                                    T* __restrict__ ptr_d, const T alpha,
-                                    const T gamma) __arm_streaming
+  static __forceinline void compute_all_tiles_for_tm(
+      const int M, const int N, const int K, const int tiles_n, const int tm,
+      const T* __restrict__ ptr_a, const T* __restrict__ ptr_b,
+      T* __restrict__ ptr_d, const T alpha, const T gamma,
+      const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
       __arm_inout("za")
 #endif
   {
-    const int tiles_m = M / ZA_TILE_M;
-    const int tiles_n = N / ZA_TILE_N;
     constexpr int nc_tiles = NC / ZA_TILE_N;
-
-    pred_t ptrue = svptrue_b64();
 
     for (int kc = 0; kc < K; kc += KC) {
       const int k_len = (kc + KC <= K) ? KC : (K - kc);
@@ -270,52 +270,76 @@ class gemm {
         const int tn_end =
             (nc + nc_tiles <= tiles_n) ? nc_tiles : (tiles_n - nc);
 
-#pragma omp parallel for
-        for (int tm = 0; tm < tiles_m; ++tm) {
-          for (int tn_local = 0; tn_local < tn_end; ++tn_local) {
-            const int tn = nc + tn_local;
+        for (int tn_local = 0; tn_local < tn_end; ++tn_local) {
+          const int tn = nc + tn_local;
 
-            // Non-packed pointers with strides M and N
-            const T* a_ptr = ptr_a + tm * ZA_TILE_M + kc * M;
-            const T* b_ptr = ptr_b + tn * ZA_TILE_N + kc * N;
-            T* c_ptr = ptr_d + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
+          // Non-packed pointers with strides M and N
+          const T* a_ptr = ptr_a + tm * ZA_TILE_M + kc * M;
+          const T* b_ptr = ptr_b + tn * ZA_TILE_N + kc * N;
+          T* c_ptr = ptr_d + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
 
-            if (is_first) {
-              svzero_za();
-            } else {
-              load_partial_c(N, c_ptr, ptrue);
-            }
+          if (is_first) {
+            svzero_za();
+          } else {
+            load_partial_c(N, c_ptr, ptrue);
+          }
 
-            microkernel_gather(M, N, k_len, a_ptr, b_ptr, ptrue);
+          microkernel_gather(M, N, k_len, a_ptr, b_ptr, ptrue);
 
-            if (is_last) {
-              store_final_c(N, c_ptr, alpha, gamma, ptrue);
-            } else {
-              store_partial_c(N, c_ptr, ptrue);
-            }
+          if (is_last) {
+            store_final_c(N, c_ptr, alpha, gamma, ptrue);
+          } else {
+            store_partial_c(N, c_ptr, ptrue);
           }
         }
       }
     }
   }
 
-  // Test wrapper
+  // =========================================================================
+  // Thread-local wrapper: creates ZA ONCE and enables streaming mode ONCE
+  // =========================================================================
 #ifndef __arm_sim
   __arm_new("za")
 #endif
-      __arm_locally_streaming static void compute_test(
-          const int M, const int N, const int K, const T* ptr_a, const T* ptr_b,
-          T* ptr_d, const T alpha, const T gamma) {
+      __arm_locally_streaming static void compute_thread_block(
+          const int M, const int N, const int K, const int tiles_n,
+          const int tm, const T* __restrict__ ptr_a,
+          const T* __restrict__ ptr_b, T* __restrict__ ptr_d, const T alpha,
+          const T gamma) {
+    pred_t ptrue = svptrue_b64();
+    compute_all_tiles_for_tm(M, N, K, tiles_n, tm, ptr_a, ptr_b, ptr_d, alpha,
+                             gamma, ptrue);
+  }
+
+  // =========================================================================
+  // Main GEMM with cache blocking and gather prefetch (NO SME attributes)
+  // =========================================================================
+  static void compute(const int M, const int N, const int K,
+                      const T* __restrict__ ptr_a, const T* __restrict__ ptr_b,
+                      T* __restrict__ ptr_d, const T alpha, const T gamma) {
+    const int tiles_m = M / ZA_TILE_M;
+    const int tiles_n = N / ZA_TILE_N;
+
+    // Each thread handles ALL kc/nc for its assigned M tile
+#pragma omp parallel for
+    for (int tm = 0; tm < tiles_m; ++tm) {
+      compute_thread_block(M, N, K, tiles_n, tm, ptr_a, ptr_b, ptr_d, alpha,
+                           gamma);
+    }
+  }
+
+  // Test wrapper (NO SME attributes)
+  static void compute_test(const int M, const int N, const int K,
+                           const T* ptr_a, const T* ptr_b, T* ptr_d,
+                           const T alpha, const T gamma) {
     compute(M, N, K, ptr_a, ptr_b, ptr_d, alpha, gamma);
   }
 
-  // Benchmark wrapper
-#ifndef __arm_sim
-  __arm_new("za")
-#endif
-      __arm_locally_streaming static double compute_benchmark(
-          const int M, const int N, const int K, const T* ptr_a, const T* ptr_b,
-          T* ptr_d, const T alpha, const T gamma) {
+  // Benchmark wrapper (NO SME attributes)
+  static double compute_benchmark(const int M, const int N, const int K,
+                                  const T* ptr_a, const T* ptr_b, T* ptr_d,
+                                  const T alpha, const T gamma) {
     for (int i = 0; i < WITERS; ++i) {
       compute(M, N, K, ptr_a, ptr_b, ptr_d, alpha, gamma);
     }
@@ -346,7 +370,6 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   T* A = new T[M * K];
   T* B = new T[K * N];
   T* D = new T[M * N];
-  T* D_ref = new T[M * N];
 
   for (int j = 0; j < K; ++j) {
     for (int i = 0; i < M; ++i) {
@@ -359,8 +382,18 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
     }
   }
   std::memset(D, 0, M * N * sizeof(T));
-  std::memset(D_ref, 0, M * N * sizeof(T));
 
+  gemm<T>::compute_test(M, N, K, A, B, D, alpha, gamma);
+
+#ifdef SKIP_VERIFY
+  printf("  SKIPPED verification (SKIP_VERIFY defined)\n");
+  delete[] A;
+  delete[] B;
+  delete[] D;
+  return true;
+#else
+  T* D_ref = new T[M * N];
+  std::memset(D_ref, 0, M * N * sizeof(T));
   for (int i = 0; i < M; ++i) {
     for (int j = 0; j < N; ++j) {
       T sum = 0;
@@ -370,8 +403,6 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
       D_ref[i * N + j] = alpha * sum + gamma;
     }
   }
-
-  gemm<T>::compute_test(M, N, K, A, B, D, alpha, gamma);
 
   bool pass = true;
   T max_err = 0;
@@ -400,6 +431,7 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   delete[] D_ref;
 
   return pass;
+#endif
 }
 
 int main() {

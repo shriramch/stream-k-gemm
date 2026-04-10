@@ -24,6 +24,9 @@
 #define NUM_THREADS 38
 #endif
 
+// Define SKIP_VERIFY to disable naive kernel and verification
+// #define SKIP_VERIFY
+
 // =============================================================================
 // GEMM class: D = alpha * A * B + gamma (beta=0 hardcoded)
 // A: column-major (M x K), B: row-major (K x N), D: row-major (M x N)
@@ -41,121 +44,137 @@ class gemm {
   using vec_t = svfloat64_t;
   using pred_t = svbool_t;
 
-  // Core GEMM kernel using all 8 ZA tiles
-  // Layout:      B0   B1   B2   B3
-  //         A0 [ t0   t1   t2   t3 ]
-  //         A1 [ t4   t5   t6   t7 ]
-  static __forceinline void compute(int M, int N, int K,
-                                    const T* __restrict__ ptr_a,
-                                    const T* __restrict__ ptr_b,
-                                    T* __restrict__ ptr_d, T alpha,
-                                    T gamma) __arm_streaming
+  // =========================================================================
+  // Thread-local tile computation kernel (has ZA state)
+  // Each thread calls this, spinning up its OWN ZA array and streaming mode.
+  // =========================================================================
+  static __forceinline void compute_tile_inner(
+      const int M, const int N, const int K, const int tm, const int tiles_n,
+      const T* __restrict__ ptr_a, const T* __restrict__ ptr_b,
+      T* __restrict__ ptr_d, const T alpha, const T gamma,
+      const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
       __arm_inout("za")
 #endif
   {
-    const int tiles_m = M / ZA_TILE_M;
-    const int tiles_n = N / ZA_TILE_N;
+    for (int tn = 0; tn < tiles_n; ++tn) {
+      // Running pointers for A and B
+      const T* a_ptr = ptr_a + tm * ZA_TILE_M;
+      const T* b_ptr = ptr_b + tn * ZA_TILE_N;
 
-    pred_t ptrue = svptrue_b64();
+      // Zero all ZA tiles
+      svzero_za();
 
-#pragma omp parallel for
-    for (int tm = 0; tm < tiles_m; ++tm) {
-      for (int tn = 0; tn < tiles_n; ++tn) {
-        // Running pointers for A and B
-        const T* a_ptr = ptr_a + tm * ZA_TILE_M;
-        const T* b_ptr = ptr_b + tn * ZA_TILE_N;
-
-        // Zero all ZA tiles
-        svzero_za();
-
-        // K loop with running pointers
+      // K loop with running pointers
 #pragma unroll 4
-        for (int k = 0; k < K; ++k) {
-          // Load 2 vectors from A column
-          vec_t a0 = svld1_vnum(ptrue, a_ptr, 0);
-          vec_t a1 = svld1_vnum(ptrue, a_ptr, 1);
+      for (int k = 0; k < K; ++k) {
+        // Load 2 vectors from A column
+        vec_t a0 = svld1_vnum(ptrue, a_ptr, 0);
+        vec_t a1 = svld1_vnum(ptrue, a_ptr, 1);
 
-          // Load 4 vectors from B row
-          vec_t b0 = svld1_vnum(ptrue, b_ptr, 0);
-          vec_t b1 = svld1_vnum(ptrue, b_ptr, 1);
-          vec_t b2 = svld1_vnum(ptrue, b_ptr, 2);
-          vec_t b3 = svld1_vnum(ptrue, b_ptr, 3);
+        // Load 4 vectors from B row
+        vec_t b0 = svld1_vnum(ptrue, b_ptr, 0);
+        vec_t b1 = svld1_vnum(ptrue, b_ptr, 1);
+        vec_t b2 = svld1_vnum(ptrue, b_ptr, 2);
+        vec_t b3 = svld1_vnum(ptrue, b_ptr, 3);
 
-          // 8 outer products
-          svmopa_za64_f64_m(0, ptrue, ptrue, a0, b0);
-          svmopa_za64_f64_m(1, ptrue, ptrue, a0, b1);
-          svmopa_za64_f64_m(2, ptrue, ptrue, a0, b2);
-          svmopa_za64_f64_m(3, ptrue, ptrue, a0, b3);
-          svmopa_za64_f64_m(4, ptrue, ptrue, a1, b0);
-          svmopa_za64_f64_m(5, ptrue, ptrue, a1, b1);
-          svmopa_za64_f64_m(6, ptrue, ptrue, a1, b2);
-          svmopa_za64_f64_m(7, ptrue, ptrue, a1, b3);
+        // 8 outer products
+        svmopa_za64_f64_m(0, ptrue, ptrue, a0, b0);
+        svmopa_za64_f64_m(1, ptrue, ptrue, a0, b1);
+        svmopa_za64_f64_m(2, ptrue, ptrue, a0, b2);
+        svmopa_za64_f64_m(3, ptrue, ptrue, a0, b3);
+        svmopa_za64_f64_m(4, ptrue, ptrue, a1, b0);
+        svmopa_za64_f64_m(5, ptrue, ptrue, a1, b1);
+        svmopa_za64_f64_m(6, ptrue, ptrue, a1, b2);
+        svmopa_za64_f64_m(7, ptrue, ptrue, a1, b3);
 
-          a_ptr += M;
-          b_ptr += N;
-        }
+        a_ptr += M;
+        b_ptr += N;
+      }
 
-        // Output tile base - use running pointer
-        T* d_ptr = ptr_d + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
+      // Output tile base - use running pointer
+      T* d_ptr = ptr_d + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
 
-        // Store first row block (tiles 0-3)
-        for (int i = 0; i < SVCNT; ++i) {
-          vec_t r0, r1, r2, r3;
-          r0 = svread_hor_za64_f64_m(r0, ptrue, 0, i);
-          r1 = svread_hor_za64_f64_m(r1, ptrue, 1, i);
-          r2 = svread_hor_za64_f64_m(r2, ptrue, 2, i);
-          r3 = svread_hor_za64_f64_m(r3, ptrue, 3, i);
-          r0 = svadd_z(ptrue, svmulx_z(ptrue, r0, alpha), gamma);
-          r1 = svadd_z(ptrue, svmulx_z(ptrue, r1, alpha), gamma);
-          r2 = svadd_z(ptrue, svmulx_z(ptrue, r2, alpha), gamma);
-          r3 = svadd_z(ptrue, svmulx_z(ptrue, r3, alpha), gamma);
-          svst1_vnum(ptrue, d_ptr, 0, r0);
-          svst1_vnum(ptrue, d_ptr, 1, r1);
-          svst1_vnum(ptrue, d_ptr, 2, r2);
-          svst1_vnum(ptrue, d_ptr, 3, r3);
-          d_ptr += N;
-        }
+      // Store first row block (tiles 0-3)
+      for (int i = 0; i < SVCNT; ++i) {
+        vec_t r0, r1, r2, r3;
+        r0 = svread_hor_za64_f64_m(r0, ptrue, 0, i);
+        r1 = svread_hor_za64_f64_m(r1, ptrue, 1, i);
+        r2 = svread_hor_za64_f64_m(r2, ptrue, 2, i);
+        r3 = svread_hor_za64_f64_m(r3, ptrue, 3, i);
+        r0 = svadd_z(ptrue, svmulx_z(ptrue, r0, alpha), gamma);
+        r1 = svadd_z(ptrue, svmulx_z(ptrue, r1, alpha), gamma);
+        r2 = svadd_z(ptrue, svmulx_z(ptrue, r2, alpha), gamma);
+        r3 = svadd_z(ptrue, svmulx_z(ptrue, r3, alpha), gamma);
+        svst1_vnum(ptrue, d_ptr, 0, r0);
+        svst1_vnum(ptrue, d_ptr, 1, r1);
+        svst1_vnum(ptrue, d_ptr, 2, r2);
+        svst1_vnum(ptrue, d_ptr, 3, r3);
+        d_ptr += N;
+      }
 
-        // Store second row block (tiles 4-7)
-        for (int i = 0; i < SVCNT; ++i) {
-          vec_t r0, r1, r2, r3;
-          r0 = svread_hor_za64_f64_m(r0, ptrue, 4, i);
-          r1 = svread_hor_za64_f64_m(r1, ptrue, 5, i);
-          r2 = svread_hor_za64_f64_m(r2, ptrue, 6, i);
-          r3 = svread_hor_za64_f64_m(r3, ptrue, 7, i);
-          r0 = svadd_z(ptrue, svmulx_z(ptrue, r0, alpha), gamma);
-          r1 = svadd_z(ptrue, svmulx_z(ptrue, r1, alpha), gamma);
-          r2 = svadd_z(ptrue, svmulx_z(ptrue, r2, alpha), gamma);
-          r3 = svadd_z(ptrue, svmulx_z(ptrue, r3, alpha), gamma);
-          svst1_vnum(ptrue, d_ptr, 0, r0);
-          svst1_vnum(ptrue, d_ptr, 1, r1);
-          svst1_vnum(ptrue, d_ptr, 2, r2);
-          svst1_vnum(ptrue, d_ptr, 3, r3);
-          d_ptr += N;
-        }
+      // Store second row block (tiles 4-7)
+      for (int i = 0; i < SVCNT; ++i) {
+        vec_t r0, r1, r2, r3;
+        r0 = svread_hor_za64_f64_m(r0, ptrue, 4, i);
+        r1 = svread_hor_za64_f64_m(r1, ptrue, 5, i);
+        r2 = svread_hor_za64_f64_m(r2, ptrue, 6, i);
+        r3 = svread_hor_za64_f64_m(r3, ptrue, 7, i);
+        r0 = svadd_z(ptrue, svmulx_z(ptrue, r0, alpha), gamma);
+        r1 = svadd_z(ptrue, svmulx_z(ptrue, r1, alpha), gamma);
+        r2 = svadd_z(ptrue, svmulx_z(ptrue, r2, alpha), gamma);
+        r3 = svadd_z(ptrue, svmulx_z(ptrue, r3, alpha), gamma);
+        svst1_vnum(ptrue, d_ptr, 0, r0);
+        svst1_vnum(ptrue, d_ptr, 1, r1);
+        svst1_vnum(ptrue, d_ptr, 2, r2);
+        svst1_vnum(ptrue, d_ptr, 3, r3);
+        d_ptr += N;
       }
     }
   }
 
-  // Test wrapper: locally streaming, creates ZA
+  // =========================================================================
+  // Thread-local wrapper: creates ZA and enables streaming mode
+  // =========================================================================
 #ifndef __arm_sim
   __arm_new("za")
 #endif
-      __arm_locally_streaming static void compute_test(
-          int M, int N, int K, const T* __restrict__ ptr_a,
-          const T* __restrict__ ptr_b, T* __restrict__ ptr_d, T alpha,
-          T gamma) {
+      __arm_locally_streaming static void compute_thread_block(
+          const int M, const int N, const int K, const int tm,
+          const int tiles_n, const T* __restrict__ ptr_a,
+          const T* __restrict__ ptr_b, T* __restrict__ ptr_d, const T alpha,
+          const T gamma) {
+    pred_t ptrue = svptrue_b64();
+    compute_tile_inner(M, N, K, tm, tiles_n, ptr_a, ptr_b, ptr_d, alpha, gamma,
+                       ptrue);
+  }
+
+  // =========================================================================
+  // Main GEMM (NO SME attributes here - handles OpenMP threading)
+  // =========================================================================
+  static void compute(int M, int N, int K, const T* __restrict__ ptr_a,
+                      const T* __restrict__ ptr_b, T* __restrict__ ptr_d,
+                      T alpha, T gamma) {
+    const int tiles_m = M / ZA_TILE_M;
+    const int tiles_n = N / ZA_TILE_N;
+
+#pragma omp parallel for
+    for (int tm = 0; tm < tiles_m; ++tm) {
+      compute_thread_block(M, N, K, tm, tiles_n, ptr_a, ptr_b, ptr_d, alpha,
+                           gamma);
+    }
+  }
+
+  // Test wrapper (NO SME attributes)
+  static void compute_test(int M, int N, int K, const T* __restrict__ ptr_a,
+                           const T* __restrict__ ptr_b, T* __restrict__ ptr_d,
+                           T alpha, T gamma) {
     compute(M, N, K, ptr_a, ptr_b, ptr_d, alpha, gamma);
   }
 
-  // Benchmark wrapper: timer INSIDE streaming region (after smstart overhead)
-#ifndef __arm_sim
-  __arm_new("za")
-#endif
-      __arm_locally_streaming static double compute_benchmark(
-          int M, int N, int K, const T* ptr_a, const T* ptr_b, T* ptr_d,
-          T alpha, T gamma) {
+  // Benchmark wrapper (NO SME attributes)
+  static double compute_benchmark(int M, int N, int K, const T* ptr_a,
+                                  const T* ptr_b, T* ptr_d, T alpha, T gamma) {
     for (int it = 0; it < WITERS; ++it) {
       compute(M, N, K, ptr_a, ptr_b, ptr_d, alpha, gamma);
     }
@@ -207,7 +226,6 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   T* A = new T[M * K];
   T* B = new T[K * N];
   T* D = new T[M * N];
-  T* D_ref = new T[M * N];
 
   // Initialize A (column-major), B (row-major), D
   for (int k = 0; k < K; ++k) {
@@ -223,14 +241,22 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   for (int i = 0; i < M; ++i) {
     for (int j = 0; j < N; ++j) {
       D[i * N + j] = static_cast<T>(0.0);
-      D_ref[i * N + j] = static_cast<T>(0.0);
     }
   }
 
   // Run SME GEMM (via compute_test wrapper)
   gemm<T>::compute_test(M, N, K, A, B, D, alpha, gamma);
 
-  // Run naive reference
+#ifdef SKIP_VERIFY
+  printf("  SKIPPED verification (SKIP_VERIFY defined)\n");
+  delete[] A;
+  delete[] B;
+  delete[] D;
+  return true;
+#else
+  // Reference
+  T* D_ref = new T[M * N];
+  for (int i = 0; i < M * N; ++i) D_ref[i] = static_cast<T>(0.0);
   naive_gemm<T>(M, N, K, A, B, D_ref, alpha, gamma);
 
   // Verify
@@ -264,6 +290,7 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   delete[] D_ref;
 
   return passed;
+#endif
 }
 
 template <typename T>

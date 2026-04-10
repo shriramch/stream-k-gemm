@@ -29,6 +29,9 @@
 #define NUM_THREADS 38
 #endif
 
+// Define SKIP_VERIFY to disable naive kernel and verification
+// #define SKIP_VERIFY
+
 // =============================================================================
 // Stream-K parameters
 // =============================================================================
@@ -253,10 +256,29 @@ class gemm {
       }
     }
 
-    // Reduction phase: combine partial sums with alpha/gamma scaling
-#pragma omp parallel for collapse(2)
+    // SVE-accelerated reduction: combine partial sums with alpha/gamma scaling
+    const vec_t v_alpha = svdup_f64(alpha);
+    const vec_t v_gamma = svdup_f64(gamma);
+
+#pragma omp parallel for
     for (int i = 0; i < M; ++i) {
-      for (int j = 0; j < N; ++j) {
+      const pred_t ptrue = svptrue_b64();
+      int j = 0;
+
+      // SVE vectorized reduction (SVCNT elements at a time)
+      for (; j + SVCNT <= N; j += SVCNT) {
+        vec_t sum = svdup_f64(0.0);
+        for (int t = 0; t < num_threads; ++t) {
+          vec_t c_vec = svld1_f64(ptrue, &C_local[t][i * N + j]);
+          sum = svadd_f64_x(ptrue, sum, c_vec);
+        }
+        // D[i,j] = alpha * sum + gamma
+        vec_t result = svmla_f64_x(ptrue, v_gamma, sum, v_alpha);
+        svst1_f64(ptrue, &D[i * N + j], result);
+      }
+
+      // Scalar remainder (if N not multiple of SVCNT)
+      for (; j < N; ++j) {
         T sum = 0;
         for (int t = 0; t < num_threads; ++t) {
           sum += C_local[t][i * N + j];
@@ -301,13 +323,10 @@ class gemm {
     }
   }
 
-  // Test wrapper with packing
-#ifndef __arm_sim
-  __arm_new("za")
-#endif
-      __arm_locally_streaming static void compute_test(
-          const int M, const int N, const int K, const T* A_colmajor,
-          const T* B_rowmajor, T* D, const T alpha, const T gamma) {
+  // Test wrapper with packing (NO SME attributes)
+  static void compute_test(const int M, const int N, const int K,
+                           const T* A_colmajor, const T* B_rowmajor, T* D,
+                           const T alpha, const T gamma) {
     const int tiles_m = M / ZA_TILE_M;
     const int tiles_n = N / ZA_TILE_N;
 
@@ -372,7 +391,6 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   T* A = new T[M * K];
   T* B = new T[K * N];
   T* D = new T[M * N];
-  T* D_ref = new T[M * N];
 
   for (int j = 0; j < K; ++j) {
     for (int i = 0; i < M; ++i) {
@@ -385,9 +403,19 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
     }
   }
   std::memset(D, 0, M * N * sizeof(T));
-  std::memset(D_ref, 0, M * N * sizeof(T));
 
-  // Reference
+  gemm<T>::compute_test(M, N, K, A, B, D, alpha, gamma);
+
+#ifdef SKIP_VERIFY
+  printf("  SKIPPED verification (SKIP_VERIFY defined)\n");
+  delete[] A;
+  delete[] B;
+  delete[] D;
+  return true;
+#else
+  // Reference (naive kernel)
+  T* D_ref = new T[M * N];
+  std::memset(D_ref, 0, M * N * sizeof(T));
   for (int i = 0; i < M; ++i) {
     for (int j = 0; j < N; ++j) {
       T sum = 0;
@@ -397,8 +425,6 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
       D_ref[i * N + j] = alpha * sum + gamma;
     }
   }
-
-  gemm<T>::compute_test(M, N, K, A, B, D, alpha, gamma);
 
   bool pass = true;
   T max_err = 0;
@@ -427,6 +453,7 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   delete[] D_ref;
 
   return pass;
+#endif
 }
 
 int main() {
