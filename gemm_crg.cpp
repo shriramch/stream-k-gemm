@@ -434,7 +434,7 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 #endif
 }
 
-int main() {
+int main(int argc, char** argv) {
   printf("SME GEMM - Gather Prefetch (Non-Packed)\n");
   printf("SVL=%d, ZA_TILE_M=%d, ZA_TILE_N=%d\n", SVL, gemm<double>::ZA_TILE_M,
          gemm<double>::ZA_TILE_N);
@@ -464,6 +464,11 @@ int main() {
   printf("\n=== Benchmark ===\n");
   {
     const int M = 64, N = 128, K = 4096;
+    if (argc == 4) {
+      M = std::atoi(argv[1]);
+      N = std::atoi(argv[2]);
+      K = std::atoi(argv[3]);
+    }
     double* A = new double[M * K];
     double* B = new double[K * N];
     double* D = new double[M * N];
