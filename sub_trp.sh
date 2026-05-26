@@ -2,7 +2,7 @@
 #DSUB --mpi hmpi
 #DSUB -x job
 #DSUB -q q_xlsdft
-#DSUB -n gemm_sme
+#DSUB -n gemm_trp
 #DSUB -rpn 1
 #DSUB -nn 1
 #DSUB -oo out.%A
@@ -11,7 +11,7 @@
 /work_ssd/software/performance_tune/root_proxy hugepage.sh 0 0 0 0 0 0 0 0
 source /work_ssd/software/HPCKit/25.2.1/setvars.sh
 
-log_file=tile_sweep_results.csv
+log_file=trp_sweep_results.csv
 rm -f $log_file
 
 BINROOT=/home/share/zhangyu/Shriramch/chefsi-gemm
@@ -26,23 +26,24 @@ export OMP_PLACES=cores
 echo "MC,NC,KC,M,N,K,time_us,GFLOP/s" > $log_file
 
 # Tile size sweep
-# MC: 32, 64, 128, 256, 616
-# NC: 64, 128, 256, 616
-# KC: 128, 256, 512, 1024
+# MC: 32, 64, 128, 256, 512
+# NC: 32, 64, 128, 256
+# KC: 64, 128, 256, 512, 1024
 
-for mc in 32 64 128 256 616; do
-    for nc in 64 128 256 616; do
-        for kc in 128 256 512 1024; do
+for mc in 32 64 128 256 512; do
+    for nc in 32 64 128 256; do
+        for kc in 64 128 256 512 1024; do
             echo "Building MC=$mc NC=$nc KC=$kc..."
-            make clean > /dev/null 2>&1
-            make MC=$mc NC=$nc KC=$kc SKIP_VERIFY=1 gemm_crsp0 2>&1
+            sme++ trp.cpp -I./include -L../libxsmm/lib -lxsmm -ldl \
+                -DMC=$mc -DNC=$nc -DKC=$kc -DSKIP_VERIFY -o trp_sweep 2>&1
             
             if [ $? -eq 0 ]; then
-                OMP_NUM_THREADS=38 mpirun -np 1 --map-by ppr:1:numa:PE=38 \
+                LD_LIBRARY_PATH=../libxsmm/lib OMP_NUM_THREADS=38 \
+                    mpirun -np 1 --map-by ppr:1:numa:PE=38 \
                     numactl --cpunodebind=0 --membind=1 \
-                    ./gemm_crsp0 616 616 175616 >> $log_file 2>&1
+                    ./trp_sweep 4096 64 175616 >> $log_file 2>&1
             else
-                echo "$mc,$nc,$kc,616,616,175616,BUILD_FAILED,0" >> $log_file
+                echo "$mc,$nc,$kc,4096,64,175616,BUILD_FAILED,0" >> $log_file
             fi
         done
     done

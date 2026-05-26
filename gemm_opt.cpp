@@ -1,7 +1,11 @@
-// SME GEMM with Cache Blocking and Linear Prefetch
-// PACKED input: A_packed[tiles_m][K][ZA_TILE_M],
-// B_packed[tiles_n][K][ZA_TILE_N] Uses simple linear prefetch (data is
-// contiguous in K dimension)
+// SME GEMM - Optimized Dense GEMM
+// Based on gemm_crgp with instruction interleaving from gemm_crsp0
+//
+// Optimizations:
+// 1. M-tile parallelization (no reduction overhead)
+// 2. 3-level cache blocking: MC×KC and KC×NC fit in L2 (1MB)
+// 3. Interleaved loads/FMOPAs to hide memory latency
+// 4. Single smstart/smstop per thread
 //
 // D = alpha * A * B + gamma
 
@@ -13,8 +17,8 @@
 #include <cstring>
 #include <type_traits>
 
-#include "utils.hpp"
 #include "hbm_alloc.hpp"
+#include "utils.hpp"
 
 #ifndef WITERS
 #define WITERS 1
@@ -28,25 +32,24 @@
 #define NUM_THREADS 38
 #endif
 
-// Define SKIP_VERIFY to disable naive kernel and verification
 // #define SKIP_VERIFY
 
-// =============================================================================
-// Cache blocking and prefetch parameters
-// =============================================================================
 #ifndef KC
-#define KC 2048
+#define KC 256
 #endif
 
 #ifndef NC
-#define NC 64
+#define NC 128
 #endif
 
-constexpr int K_UNROLL = 8;  // Unroll factor
-constexpr int PF_DIST = 16;  // Prefetch distance in K iterations
+#ifndef MC
+#define MC 64
+#endif
+
+constexpr int PF_DIST = 12;  // Prefetch distance (tuned for KC=256)
 
 // =============================================================================
-// GEMM class with linear prefetch for packed input
+// GEMM class with cache blocking and interleaved microkernel
 // =============================================================================
 
 template <typename T>
@@ -60,39 +63,47 @@ class gemm {
   using pred_t = svbool_t;
 
   // =========================================================================
-  // Micro-kernel with linear prefetch for contiguous packed A/B
-  // A_packed: contiguous [K][ZA_TILE_M], stride = ZA_TILE_M = 128 bytes
-  // B_packed: contiguous [K][ZA_TILE_N], stride = ZA_TILE_N = 256 bytes
+  // Interleaved microkernel: loads interleaved with FMOPAs
+  // This hides load latency by computing while next data arrives
+  // A_packed: [K][ZA_TILE_M], B_packed: [K][ZA_TILE_N]
   // =========================================================================
-  static __forceinline void microkernel_prefetch(
+  static __forceinline void microkernel_interleaved(
       const int k_len, const T* __restrict__ a_ptr, const T* __restrict__ b_ptr,
       const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
       __arm_inout("za")
 #endif
   {
+    // Main loop with interleaved loads and computes
     for (int k = 0; k < k_len; ++k) {
-      // Linear prefetch PF_DIST iterations ahead
+      // Prefetch PF_DIST iterations ahead (linear in packed layout)
       if (k + PF_DIST < k_len) {
         __builtin_prefetch(a_ptr + PF_DIST * ZA_TILE_M, 0, 3);
         __builtin_prefetch(b_ptr + PF_DIST * ZA_TILE_N, 0, 3);
+        __builtin_prefetch(b_ptr + PF_DIST * ZA_TILE_N + 128, 0,
+                           3);  // 2nd cacheline
       }
 
+      // Load A vectors (always needed first)
       vec_t a0 = svld1_vnum(ptrue, a_ptr, 0);
       vec_t a1 = svld1_vnum(ptrue, a_ptr, 1);
 
+      // Interleaved pattern: load B, compute immediately
+      // This allows OOO execution to overlap next load with current compute
       vec_t b0 = svld1_vnum(ptrue, b_ptr, 0);
-      vec_t b1 = svld1_vnum(ptrue, b_ptr, 1);
-      vec_t b2 = svld1_vnum(ptrue, b_ptr, 2);
-      vec_t b3 = svld1_vnum(ptrue, b_ptr, 3);
-
       svmopa_za64_f64_m(0, ptrue, ptrue, a0, b0);
-      svmopa_za64_f64_m(1, ptrue, ptrue, a0, b1);
-      svmopa_za64_f64_m(2, ptrue, ptrue, a0, b2);
-      svmopa_za64_f64_m(3, ptrue, ptrue, a0, b3);
       svmopa_za64_f64_m(4, ptrue, ptrue, a1, b0);
+
+      vec_t b1 = svld1_vnum(ptrue, b_ptr, 1);
+      svmopa_za64_f64_m(1, ptrue, ptrue, a0, b1);
       svmopa_za64_f64_m(5, ptrue, ptrue, a1, b1);
+
+      vec_t b2 = svld1_vnum(ptrue, b_ptr, 2);
+      svmopa_za64_f64_m(2, ptrue, ptrue, a0, b2);
       svmopa_za64_f64_m(6, ptrue, ptrue, a1, b2);
+
+      vec_t b3 = svld1_vnum(ptrue, b_ptr, 3);
+      svmopa_za64_f64_m(3, ptrue, ptrue, a0, b3);
       svmopa_za64_f64_m(7, ptrue, ptrue, a1, b3);
 
       a_ptr += ZA_TILE_M;
@@ -101,7 +112,7 @@ class gemm {
   }
 
   // =========================================================================
-  // Load/Store C from/to row-major (same as non-packed version)
+  // Load partial C from row-major memory
   // =========================================================================
   static __forceinline void load_partial_c(const int N,
                                            const T* __restrict__ c_ptr,
@@ -135,6 +146,9 @@ class gemm {
     }
   }
 
+  // =========================================================================
+  // Store partial C to row-major memory (no scaling)
+  // =========================================================================
   static __forceinline void store_partial_c(const int N, T* __restrict__ c_ptr,
                                             const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
@@ -168,6 +182,9 @@ class gemm {
     }
   }
 
+  // =========================================================================
+  // Store final C with alpha/gamma scaling
+  // =========================================================================
   static __forceinline void store_final_c(const int N, T* __restrict__ c_ptr,
                                           const T alpha, const T gamma,
                                           const pred_t ptrue) __arm_streaming
@@ -211,49 +228,64 @@ class gemm {
   }
 
   // =========================================================================
-  // Thread-local execution: processes ALL kc/nc for this thread's M tile
-  // Only ONE smstart/smstop per thread per GEMM call
+  // Thread-local blocked computation: processes M tiles with L2 blocking
+  // Loop order: kc → mc → nc → tm/tn (K outer keeps A panel hot in L2)
+  //
+  // Cache efficiency analysis for KC=256, MC=64, NC=128:
+  // - A block: 64 × 256 × 8 = 128 KB (fits in L2)
+  // - B block: 256 × 128 × 8 = 256 KB (fits in L2)
+  // - C block: 64 × 128 × 8 = 64 KB (fits in L2)
+  // - Total working set: ~448 KB < 1 MB L2
   // =========================================================================
-  static __forceinline void compute_all_tiles_for_tm(
-      const int M, const int N, const int K, const int tiles_n, const int tm,
-      const T* __restrict__ A_packed, const T* __restrict__ B_packed,
-      T* __restrict__ D, const T alpha, const T gamma,
-      const pred_t ptrue) __arm_streaming
+  static __forceinline void compute_blocked(
+      const int M, const int N, const int K, const int tm_start,
+      const int tm_end, const T* __restrict__ A_packed,
+      const T* __restrict__ B_packed, T* __restrict__ D, const T alpha,
+      const T gamma, const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
       __arm_inout("za")
 #endif
   {
+    const int tiles_n = N / ZA_TILE_N;
+    constexpr int mc_tiles = MC / ZA_TILE_M;
     constexpr int nc_tiles = NC / ZA_TILE_N;
 
+    // 1. K-Blocking (OUTER): Process K in chunks to keep A/B panels in L2
     for (int kc = 0; kc < K; kc += KC) {
       const int k_len = (kc + KC <= K) ? KC : (K - kc);
       const bool is_first = (kc == 0);
       const bool is_last = (kc + KC >= K);
 
+      // 3. N-Blocking: Process N in NC-sized chunks (B panel reuse)
       for (int nc = 0; nc < tiles_n; nc += nc_tiles) {
-        const int tn_end =
-            (nc + nc_tiles <= tiles_n) ? nc_tiles : (tiles_n - nc);
+        const int nc_end = (nc + nc_tiles <= tiles_n) ? nc + nc_tiles : tiles_n;
 
-        for (int tn_local = 0; tn_local < tn_end; ++tn_local) {
-          const int tn = nc + tn_local;
+        // 2. M-Blocking: Process assigned M tiles in MC-sized chunks
+        for (int mc = tm_start; mc < tm_end; mc += mc_tiles) {
+          const int mc_end = (mc + mc_tiles <= tm_end) ? mc + mc_tiles : tm_end;
 
-          // Packed pointers
-          const T* a_ptr = A_packed + (tm * K + kc) * ZA_TILE_M;
-          const T* b_ptr = B_packed + (tn * K + kc) * ZA_TILE_N;
-          T* c_ptr = D + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
+          // 4. Process M×N tile block
+          for (int tn = nc; tn < nc_end; ++tn) {
+            for (int tm = mc; tm < mc_end; ++tm) {
+              // Packed pointers with kc offset
+              const T* a_ptr = A_packed + (tm * K + kc) * ZA_TILE_M;
+              const T* b_ptr = B_packed + (tn * K + kc) * ZA_TILE_N;
+              T* c_ptr = D + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
 
-          if (is_first) {
-            svzero_za();
-          } else {
-            load_partial_c(N, c_ptr, ptrue);
-          }
+              if (is_first) {
+                svzero_za();
+              } else {
+                load_partial_c(N, c_ptr, ptrue);
+              }
 
-          microkernel_prefetch(k_len, a_ptr, b_ptr, ptrue);
+              microkernel_interleaved(k_len, a_ptr, b_ptr, ptrue);
 
-          if (is_last) {
-            store_final_c(N, c_ptr, alpha, gamma, ptrue);
-          } else {
-            store_partial_c(N, c_ptr, ptrue);
+              if (is_last) {
+                store_final_c(N, c_ptr, alpha, gamma, ptrue);
+              } else {
+                store_partial_c(N, c_ptr, ptrue);
+              }
+            }
           }
         }
       }
@@ -261,45 +293,56 @@ class gemm {
   }
 
   // =========================================================================
-  // Thread-local wrapper: creates ZA ONCE and enables streaming mode ONCE
+  // Thread wrapper: single smstart/smstop per thread
   // =========================================================================
 #ifndef __arm_sim
   __arm_new("za")
 #endif
       __arm_locally_streaming static void compute_thread_block(
-          const int M, const int N, const int K, const int tiles_n,
-          const int tm, const T* __restrict__ A_packed,
+          const int M, const int N, const int K, const int tm_start,
+          const int tm_end, const T* __restrict__ A_packed,
           const T* __restrict__ B_packed, T* __restrict__ D, const T alpha,
           const T gamma) {
     pred_t ptrue = svptrue_b64();
-    compute_all_tiles_for_tm(M, N, K, tiles_n, tm, A_packed, B_packed, D, alpha,
-                             gamma, ptrue);
+    compute_blocked(M, N, K, tm_start, tm_end, A_packed, B_packed, D, alpha,
+                    gamma, ptrue);
   }
 
   // =========================================================================
-  // Main GEMM: packed A/B with prefetch, row-major C (NO SME attributes)
+  // Main GEMM: packed A/B, row-major C, M-tile parallelization
   // =========================================================================
   static void compute_packed(const int M, const int N, const int K,
                              const T* __restrict__ A_packed,
                              const T* __restrict__ B_packed, T* __restrict__ D,
                              const T alpha, const T gamma) {
     const int tiles_m = M / ZA_TILE_M;
-    const int tiles_n = N / ZA_TILE_N;
+    const int num_threads = omp_get_max_threads();
 
-    // Each thread handles ALL kc/nc for its assigned M tile
-#pragma omp parallel for
-    for (int tm = 0; tm < tiles_m; ++tm) {
-      compute_thread_block(M, N, K, tiles_n, tm, A_packed, B_packed, D, alpha,
-                           gamma);
+    // Distribute M tiles across threads (contiguous for cache locality)
+    const int tiles_per_thread = (tiles_m + num_threads - 1) / num_threads;
+
+#pragma omp parallel
+    {
+      const int tid = omp_get_thread_num();
+      const int tm_start = tid * tiles_per_thread;
+      const int tm_end = (tm_start + tiles_per_thread <= tiles_m)
+                             ? tm_start + tiles_per_thread
+                             : tiles_m;
+
+      if (tm_start < tiles_m) {
+        compute_thread_block(M, N, K, tm_start, tm_end, A_packed, B_packed, D,
+                             alpha, gamma);
+      }
     }
   }
 
   // =========================================================================
-  // Pack routines
+  // Pack A: column-major → packed [tiles_m][K][ZA_TILE_M]
   // =========================================================================
   static void pack_A(const int M, const int K, const T* A_colmajor,
                      T* A_packed) {
     const int tiles_m = M / ZA_TILE_M;
+#pragma omp parallel for collapse(2)
     for (int tm = 0; tm < tiles_m; ++tm) {
       for (int k = 0; k < K; ++k) {
         for (int i = 0; i < ZA_TILE_M; ++i) {
@@ -310,9 +353,13 @@ class gemm {
     }
   }
 
+  // =========================================================================
+  // Pack B: row-major → packed [tiles_n][K][ZA_TILE_N]
+  // =========================================================================
   static void pack_B(const int N, const int K, const T* B_rowmajor,
                      T* B_packed) {
     const int tiles_n = N / ZA_TILE_N;
+#pragma omp parallel for collapse(2)
     for (int tn = 0; tn < tiles_n; ++tn) {
       for (int k = 0; k < K; ++k) {
         for (int j = 0; j < ZA_TILE_N; ++j) {
@@ -323,7 +370,9 @@ class gemm {
     }
   }
 
-  // Test wrapper (NO SME attributes)
+  // =========================================================================
+  // Test wrapper
+  // =========================================================================
   static void compute_test(const int M, const int N, const int K,
                            const T* A_colmajor, const T* B_rowmajor, T* D,
                            const T alpha, const T gamma) {
@@ -342,7 +391,9 @@ class gemm {
     hbm_free(B_packed);
   }
 
-  // Benchmark wrapper (NO SME attributes)
+  // =========================================================================
+  // Benchmark wrapper
+  // =========================================================================
   static double compute_benchmark(const int M, const int N, const int K,
                                   const T* A_colmajor, const T* B_rowmajor,
                                   T* D, const T alpha, const T gamma) {
@@ -355,6 +406,7 @@ class gemm {
     pack_A(M, K, A_colmajor, A_packed);
     pack_B(N, K, B_rowmajor, B_packed);
 
+    // Warmup
     for (int i = 0; i < WITERS; ++i) {
       compute_packed(M, N, K, A_packed, B_packed, D, alpha, gamma);
     }
@@ -380,10 +432,8 @@ class gemm {
 template <typename T>
 bool test_gemm(int M, int N, int K, T alpha, T gamma) {
   const char* type_name = std::is_same<T, float>::value ? "float" : "double";
-  printf(
-      "Testing GEMM<%s> PACKED+PREFETCH: M=%d N=%d K=%d alpha=%.2f "
-      "gamma=%.2f\n",
-      type_name, M, N, K, alpha, gamma);
+  printf("Testing GEMM<%s> OPTIMIZED: M=%d N=%d K=%d alpha=%.2f gamma=%.2f\n",
+         type_name, M, N, K, alpha, gamma);
 
   omp_set_num_threads(NUM_THREADS);
 
@@ -454,60 +504,54 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 #endif
 }
 
+// =============================================================================
+// Main
+// =============================================================================
+
 int main(int argc, char** argv) {
   hbm_init();
-  printf("SME GEMM - Packed + Linear Prefetch\n");
-  printf("SVL=%d, ZA_TILE_M=%d, ZA_TILE_N=%d\n", SVL, gemm<double>::ZA_TILE_M,
-         gemm<double>::ZA_TILE_N);
-  printf("KC=%d, NC=%d, K_UNROLL=%d, PF_DIST=%d\n", KC, NC, K_UNROLL, PF_DIST);
-  printf("Threads=%d\n\n", NUM_THREADS);
 
-  int passed = 0, total = 0;
-
-  printf("=== Test 1: Small K ===\n");
+#ifndef SKIP_VERIFY
+  // Run verification tests only if SKIP_VERIFY is not defined
+  int passed = 0;
   if (test_gemm<double>(32, 64, 128, 1.0, 0.0)) passed++;
-  total++;
-
-  printf("\n=== Test 2: K > KC ===\n");
   if (test_gemm<double>(32, 64, 4096, 1.0, 0.0)) passed++;
-  total++;
-
-  printf("\n=== Test 3: With scaling ===\n");
   if (test_gemm<double>(32, 64, 4096, 2.0, 0.5)) passed++;
-  total++;
-
-  printf("\n=== Test 4: Larger M, N ===\n");
   if (test_gemm<double>(64, 128, 2048, 1.0, 0.0)) passed++;
-  total++;
+  if (passed != 4) {
+    printf("FAIL: %d/4 tests passed\n", passed);
+    return 1;
+  }
+#endif
 
-  printf("\n=== Summary: %d/%d tests passed ===\n", passed, total);
-
-  printf("\n=== Benchmark ===\n");
-  {
-    const int M = 64, N = 128, K = 4096;
-    if (argc == 4) {
-      M = std::atoi(argv[1]);
-      N = std::atoi(argv[2]);
-      K = std::atoi(argv[3]);
-    }
-    double* A = hbm_alloc<double>(M * K);
-    double* B = hbm_alloc<double>(K * N);
-    double* D = hbm_alloc<double>(M * N);
-    std::memset(A, 0, M * K * sizeof(double));
-    std::memset(B, 0, K * N * sizeof(double));
-    std::memset(D, 0, M * N * sizeof(double));
-
-    printf("M=%d N=%d K=%d (K blocks=%d)\n", M, N, K, (K + KC - 1) / KC);
-
-    omp_set_num_threads(NUM_THREADS);
-    double ns = gemm<double>::compute_benchmark(M, N, K, A, B, D, 1.0, 0.0);
-    double gflops = (2.0 * M * N * K) / ns;
-    printf("  Time: %.2f us, %.2f GFLOP/s\n", ns / 1000.0, gflops);
-
-    hbm_free(A);
-    hbm_free(B);
-    hbm_free(D);
+  // Benchmark - concise output for sweep scripts
+  int M = 616, N = 616, K = 175616;
+  if (argc == 4) {
+    M = std::atoi(argv[1]);
+    N = std::atoi(argv[2]);
+    K = std::atoi(argv[3]);
   }
 
-  return (passed == total) ? 0 : 1;
+  omp_set_num_threads(NUM_THREADS);
+  double* A = hbm_alloc<double>(M * K);
+  double* B = hbm_alloc<double>(K * N);
+  double* D = hbm_alloc<double>(M * N);
+
+  for (int i = 0; i < M * K; ++i) A[i] = 0.001 * i;
+  for (int i = 0; i < K * N; ++i) B[i] = 0.001 * i;
+  std::memset(D, 0, M * N * sizeof(double));
+
+  double time_ns = gemm<double>::compute_benchmark(M, N, K, A, B, D, 1.0, 0.0);
+  double time_us = time_ns / 1000.0;
+  double flops = 2.0 * M * N * K;
+  double gflops = flops / time_ns;
+
+  // CSV-style output: MC,NC,KC,M,N,K,time_us,GFLOP/s
+  printf("%d,%d,%d,%d,%d,%d,%.2f,%.2f\n", MC, NC, KC, M, N, K, time_us, gflops);
+
+  hbm_free(A);
+  hbm_free(B);
+  hbm_free(D);
+
+  return 0;
 }

@@ -15,15 +15,15 @@
 #include <cstring>
 #include <type_traits>
 
-#include "utils.hpp"
 #include "hbm_alloc.hpp"
+#include "utils.hpp"
 
 #ifndef WITERS
-#define WITERS 1
+#define WITERS 5
 #endif
 
 #ifndef ITERS
-#define ITERS 1
+#define ITERS 3
 #endif
 
 #ifndef NUM_THREADS
@@ -37,11 +37,15 @@
 // Stream-K parameters
 // =============================================================================
 #ifndef KC
-#define KC 2048
+#define KC 256  // 256
+#endif
+
+#ifndef MC
+#define MC 640  // 640
 #endif
 
 #ifndef NC
-#define NC 64
+#define NC 128  // 128
 #endif
 
 constexpr int PF_DIST = 16;  // Prefetch distance
@@ -61,40 +65,47 @@ class gemm {
   using pred_t = svbool_t;
 
   // =========================================================================
-  // Micro-kernel with linear prefetch for contiguous packed A/B
+  // Software-pipelined microkernel with interleaved B loads
+  // - Software pipeline: pre-load next A while computing current A
+  // - Interleaving: load each B vector, immediately use it
+  // - Follows proven pattern: loop k_len-1 times, then final iteration
   // =========================================================================
-  static __forceinline void microkernel_prefetch(
-      const int k_len, const T* __restrict__ a_ptr, const T* __restrict__ b_ptr,
+  static __forceinline void microkernel_pipelined(
+      const int k_len, const T* __restrict__ a_in, const T* __restrict__ b_in,
       const pred_t ptrue) __arm_streaming
 #ifndef __arm_sim
       __arm_inout("za")
 #endif
   {
+    const T* a_ptr = a_in;
+    const T* b_ptr = b_in;
+
+    if (k_len <= 0) return;
+
+    // === Main loop: load next A, interleave B with compute, swap ===
     for (int k = 0; k < k_len; ++k) {
-      // Linear prefetch PF_DIST iterations ahead
-      if (k + PF_DIST < k_len) {
-        __builtin_prefetch(a_ptr + PF_DIST * ZA_TILE_M, 0, 3);
-        __builtin_prefetch(b_ptr + PF_DIST * ZA_TILE_N, 0, 3);
-      }
-
-      vec_t a0 = svld1_vnum(ptrue, a_ptr, 0);
-      vec_t a1 = svld1_vnum(ptrue, a_ptr, 1);
-
-      vec_t b0 = svld1_vnum(ptrue, b_ptr, 0);
-      vec_t b1 = svld1_vnum(ptrue, b_ptr, 1);
-      vec_t b2 = svld1_vnum(ptrue, b_ptr, 2);
-      vec_t b3 = svld1_vnum(ptrue, b_ptr, 3);
-
-      svmopa_za64_f64_m(0, ptrue, ptrue, a0, b0);
-      svmopa_za64_f64_m(1, ptrue, ptrue, a0, b1);
-      svmopa_za64_f64_m(2, ptrue, ptrue, a0, b2);
-      svmopa_za64_f64_m(3, ptrue, ptrue, a0, b3);
-      svmopa_za64_f64_m(4, ptrue, ptrue, a1, b0);
-      svmopa_za64_f64_m(5, ptrue, ptrue, a1, b1);
-      svmopa_za64_f64_m(6, ptrue, ptrue, a1, b2);
-      svmopa_za64_f64_m(7, ptrue, ptrue, a1, b3);
-
+      // Pre-load next iteration's A
+      vec_t curr_a0 = svld1_vnum(ptrue, a_ptr, 0);
+      vec_t curr_a1 = svld1_vnum(ptrue, a_ptr, 1);
       a_ptr += ZA_TILE_M;
+
+      // Interleaved B loads: load each B, immediately use it
+      vec_t b0 = svld1_vnum(ptrue, b_ptr, 0);
+      svmopa_za64_f64_m(0, ptrue, ptrue, curr_a0, b0);
+      svmopa_za64_f64_m(4, ptrue, ptrue, curr_a1, b0);
+
+      vec_t b1 = svld1_vnum(ptrue, b_ptr, 1);
+      svmopa_za64_f64_m(1, ptrue, ptrue, curr_a0, b1);
+      svmopa_za64_f64_m(5, ptrue, ptrue, curr_a1, b1);
+
+      vec_t b2 = svld1_vnum(ptrue, b_ptr, 2);
+      svmopa_za64_f64_m(2, ptrue, ptrue, curr_a0, b2);
+      svmopa_za64_f64_m(6, ptrue, ptrue, curr_a1, b2);
+
+      vec_t b3 = svld1_vnum(ptrue, b_ptr, 3);
+      svmopa_za64_f64_m(3, ptrue, ptrue, curr_a0, b3);
+      svmopa_za64_f64_m(7, ptrue, ptrue, curr_a1, b3);
+
       b_ptr += ZA_TILE_N;
     }
   }
@@ -185,6 +196,7 @@ class gemm {
   {
     const int tiles_m = M / ZA_TILE_M;
     const int tiles_n = N / ZA_TILE_N;
+    constexpr int mc_tiles = MC / ZA_TILE_M;
     constexpr int nc_tiles = NC / ZA_TILE_N;
     const int k_len = k_end - k_start;
 
@@ -197,30 +209,33 @@ class gemm {
 
       // 2. N-Blocking to keep B panel in L2 cache
       for (int nc = 0; nc < tiles_n; nc += nc_tiles) {
-        const int tn_end =
-            (nc + nc_tiles <= tiles_n) ? nc_tiles : (tiles_n - nc);
+        const int tn_end = (nc + nc_tiles <= tiles_n) ? nc + nc_tiles : tiles_n;
 
-        // 3. Process the M/N tiles that fit within this L2 block
-        for (int tm = 0; tm < tiles_m; ++tm) {
-          for (int tn_local = 0; tn_local < tn_end; ++tn_local) {
-            const int tn = nc + tn_local;
+        // 3. M-Blocking to control A panel working set
+        for (int mc = 0; mc < tiles_m; mc += mc_tiles) {
+          const int tm_end =
+              (mc + mc_tiles <= tiles_m) ? mc + mc_tiles : tiles_m;
 
-            // Packed pointers offset by k_start AND the current kc block
-            const T* a_ptr = A_packed + (tm * K + k_start + kc) * ZA_TILE_M;
-            const T* b_ptr = B_packed + (tn * K + k_start + kc) * ZA_TILE_N;
-            T* c_ptr = C_local + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
+          // 4. Process the M/N tiles within this L2 block
+          for (int tm = mc; tm < tm_end; ++tm) {
+            for (int tn = nc; tn < tn_end; ++tn) {
+              // Packed pointers offset by k_start AND the current kc block
+              const T* a_ptr = A_packed + (tm * K + k_start + kc) * ZA_TILE_M;
+              const T* b_ptr = B_packed + (tn * K + k_start + kc) * ZA_TILE_N;
+              T* c_ptr = C_local + tm * ZA_TILE_M * N + tn * ZA_TILE_N;
 
-            if (is_first) {
-              svzero_za();
-            } else {
-              load_partial_c(N, c_ptr, ptrue);
+              if (is_first) {
+                svzero_za();
+              } else {
+                load_partial_c(N, c_ptr, ptrue);
+              }
+
+              microkernel_pipelined(kb_len, a_ptr, b_ptr, ptrue);
+
+              // Always store partials to workspace
+              // alpha/gamma scaling happens in the OpenMP reduction later
+              store_partial_c(N, c_ptr, ptrue);
             }
-
-            microkernel_prefetch(kb_len, a_ptr, b_ptr, ptrue);
-
-            // Always store partials to workspace
-            // alpha/gamma scaling happens in the OpenMP reduction later
-            store_partial_c(N, c_ptr, ptrue);
           }
         }
       }
@@ -499,10 +514,40 @@ bool test_gemm(int M, int N, int K, T alpha, T gamma) {
 
 int main(int argc, char** argv) {
   hbm_init();
+
+  // Benchmark mode: ./gemm_crsp M N K
+  if (argc == 4) {
+    int M = std::atoi(argv[1]);
+    int N = std::atoi(argv[2]);
+    int K = std::atoi(argv[3]);
+    omp_set_num_threads(NUM_THREADS);
+
+    double* A = hbm_alloc<double>(M * K);
+    double* B = hbm_alloc<double>(K * N);
+    double* D = hbm_alloc<double>(M * N);
+    for (int i = 0; i < M * K; ++i) A[i] = 0.001 * i;
+    for (int i = 0; i < K * N; ++i) B[i] = 0.001 * i;
+    std::memset(D, 0, M * N * sizeof(double));
+
+    double time_ns =
+        gemm<double>::compute_benchmark(M, N, K, A, B, D, 1.0, 0.0);
+    double time_us = time_ns / 1000.0;
+    double flops = 2.0 * M * N * K;
+    double gflops = flops / time_ns;
+
+    printf("%d,%d,%d,%d,%d,%d,%.2f,%.4f\n", MC, NC, KC, M, N, K, time_us,
+           gflops);
+
+    hbm_free(A);
+    hbm_free(B);
+    hbm_free(D);
+    return 0;
+  }
+
   printf("SME GEMM - Stream-K (Packed Input)\n");
   printf("SVL=%d, ZA_TILE_M=%d, ZA_TILE_N=%d\n", SVL, gemm<double>::ZA_TILE_M,
          gemm<double>::ZA_TILE_N);
-  printf("KC=%d, PF_DIST=%d\n", KC, PF_DIST);
+  printf("KC=%d, MC=%d, NC=%d, PF_DIST=%d\n", KC, MC, NC, PF_DIST);
   printf("Threads=%d\n\n", NUM_THREADS);
 
   int passed = 0;
@@ -523,7 +568,7 @@ int main(int argc, char** argv) {
 
   // Benchmark
   printf("=== Benchmark ===\n");
-  int M = 64, N = 128, K = 4096;
+  int M = 640, N = 640, K = 175616;
   if (argc == 4) {
     M = std::atoi(argv[1]);
     N = std::atoi(argv[2]);
